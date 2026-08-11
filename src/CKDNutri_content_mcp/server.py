@@ -11,7 +11,7 @@ from typing import Any, Optional
 
 from fastmcp import FastMCP
 
-from a207_policy import CallerError
+from ._policy import CallerError
 
 from . import core as _core
 

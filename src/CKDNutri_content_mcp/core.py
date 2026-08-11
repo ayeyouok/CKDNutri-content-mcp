@@ -13,7 +13,7 @@ import os
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from a207_policy import (
+from ._policy import (
     CLINICIAN_ONLY_FIELDS,
     CLINICIAN_ONLY_HIDDEN_FROM,
     enforce_read,
