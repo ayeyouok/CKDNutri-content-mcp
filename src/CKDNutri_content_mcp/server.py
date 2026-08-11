@@ -12,9 +12,9 @@ from a207_policy import CallerError
 
 from .core import (
     generate_patient_report,
-    get_citation_tool,
-    search_guideline_tool,
-    search_sop_tool,
+    get_citation,
+    search_guideline,
+    search_sop,
 )
 
 mcp = FastMCP("CKDNutri-content-mcp")
@@ -36,7 +36,7 @@ def main():
 def search_guideline(keyword: str) -> dict[str, Any]:
     """语义检索指南（按角色视图裁剪：临床=专业语料，家庭=通俗语料）。"""
     try:
-        return search_guideline_tool(keyword)
+        return search_guideline(keyword)
     except Exception as exc:
         return _invalid(exc)
 
@@ -45,7 +45,7 @@ def search_guideline(keyword: str) -> dict[str, Any]:
 def search_sop(keyword: str) -> dict[str, Any]:
     """检索临床 SOP。"""
     try:
-        return search_sop_tool(keyword)
+        return search_sop(keyword)
     except Exception as exc:
         return _invalid(exc)
 
@@ -54,7 +54,7 @@ def search_sop(keyword: str) -> dict[str, Any]:
 def get_citation(entry_id: str) -> dict[str, Any]:
     """返回指定指南条目的完整出处。"""
     try:
-        return get_citation_tool(entry_id)
+        return get_citation(entry_id)
     except Exception as exc:
         return _invalid(exc)
 

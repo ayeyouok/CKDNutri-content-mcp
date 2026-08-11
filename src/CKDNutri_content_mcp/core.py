@@ -10,9 +10,16 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from a207_policy import enforce_read, get_caller, knowledge_profile
+from a207_policy import (
+    CLINICIAN_ONLY_FIELDS,
+    CLINICIAN_ONLY_HIDDEN_FROM,
+    enforce_read,
+    get_caller,
+    knowledge_profile,
+)
 
 # 本包在权限矩阵中的登记名（enforce_* 查表键，唯一事实源在 a207_policy.matrix）。
 MCP_NAME = "CKDNutri-content-mcp"
@@ -155,6 +162,65 @@ def _self_test_refs() -> List[str]:
     guides = _load_guides()
     sops = _load_sops()
     return [e["id"] for e in guides["entries"]] + [s["id"] for s in sops["sops"]]
+
+
+# ---- M9: report generation helpers (recovered from a207-report-mcp) ----
+
+_RISK_TO_STATUS = {
+    "L1": "critical", "high": "critical",
+    "L2": "caution", "L3": "caution", "medium": "caution",
+    "L0": "stable", "low": "stable", "none": "stable",
+}
+
+
+def _pew_trend(pew_history: list[dict]) -> str:
+    if not pew_history or len(pew_history) < 2:
+        return "no_data"
+    order = {"low": 0, "medium": 1, "high": 2}
+    fo = order.get(pew_history[0].get("level", "low"), 0)
+    lo = order.get(pew_history[-1].get("level", "low"), 0)
+    return "worsening" if lo > fo else "improving" if lo < fo else "stable"
+
+
+def _derive_status(risk_level: str, pew_history: list[dict],
+                   nutrition_assessment: dict) -> str:
+    base = _RISK_TO_STATUS.get(risk_level, "stable")
+    # PEW 恶化 → 至少 caution
+    if _pew_trend(pew_history) == "worsening" and base == "stable":
+        base = "caution"
+    # 营养摄入达成率过低（<50%）→ 至少 caution
+    try:
+        ach = nutrition_assessment.get("intake", {}).get("achievement", {})
+        energy_pct = ach.get("energy_pct", 100)
+        if isinstance(energy_pct, (int, float)) and energy_pct < 50:
+            if base == "stable":
+                base = "caution"
+    except Exception:
+        pass
+    return base
+
+
+def _section(title: str, body: str) -> str:
+    return f"### {title}\n{body}\n"
+
+
+# 仅临床角色可见字段（MX-1 字段可见性边界）：单一事实源直接引用 a207_policy.CLINICIAN_ONLY_FIELDS，
+# 不再在包内维护副本（消除 OD-011/OD-013 指出的副本漂移）。
+_CLINICIAN_ONLY: frozenset[str] = CLINICIAN_ONLY_FIELDS
+
+# 非临床角色（家长/患儿）绝不可见 CLINICIAN_ONLY_FIELDS；角色集合单一事实源在
+# a207_policy.CLINICIAN_ONLY_HIDDEN_FROM（C3 禁止包内硬编码）。
+_NON_CLINICAL_MASKED: frozenset[str] = CLINICIAN_ONLY_HIDDEN_FROM
+
+
+def _mask_clinician_fields(value: Any) -> Any:
+    """递归剔除仅临床可见字段，用于生成对外可读文案 / 受限视图。"""
+    if isinstance(value, dict):
+        return {k: _mask_clinician_fields(v) for k, v in value.items()
+                if k not in _CLINICIAN_ONLY}
+    if isinstance(value, list):
+        return [_mask_clinician_fields(v) for v in value]
+    return value
 
 
 # ---- M9: report generation ----
