@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "CKDNutri-content-mcp"
+version = "0.3.0"
+description = "P5 内容输出域——报告生成+循证知识库"
+requires-python = ">=3.10"
+dependencies = [
+    "fastmcp>=2.0",
+    "pydantic>=2",
+    "a207-policy==0.3.0",
+]
+
+[project.scripts]
+CKDNutri-content-mcp = "CKDNutri_content_mcp.server:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
