@@ -21,7 +21,13 @@ mcp = FastMCP("CKDNutri-content-mcp")
 
 def _invalid(exc):
     if isinstance(exc, CallerError):
-        raise
+        # BUG-54（2026-08-12）：越权/身份未解析统一返回 FORBIDDEN 信封（与 clinical-data
+        # _guard_access / care _guard 同格式），不再向上抛导致 500。此前本包 4 处裸调
+        # enforce_read 的读工具越权即 500 崩溃。PermissionDenied 带 caller/action/reason，
+        # CallerUnknown 缺字段时降级文案。
+        return {"ok": False, "error": "FORBIDDEN",
+                "detail": f"caller={getattr(exc, 'caller', '?')} 无权 {getattr(exc, 'action', 'access')}"
+                          f"（{getattr(exc, 'reason', str(exc))}）"}
     return {"ok": False, "error": "INVALID_INPUT", "detail": str(exc)}
 
 
