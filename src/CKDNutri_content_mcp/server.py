@@ -8,6 +8,7 @@ v0.3.9（BUG-16）修复：工具命名统一 _tool 后缀，与其他域包（*
 """
 from __future__ import annotations
 
+import json
 from typing import Any, Optional
 
 from fastmcp import FastMCP
@@ -28,6 +29,14 @@ def _invalid(exc):
         return {"ok": False, "error": "FORBIDDEN",
                 "detail": f"caller={getattr(exc, 'caller', '?')} 无权 {getattr(exc, 'action', 'access')}"
                           f"（{getattr(exc, 'reason', str(exc))}）"}
+    # BUG-56（2026-08-12）：区分"入参错误"与"内部数据/环境错误"（对齐 nutrition/care/assessment
+    # BUG-52 口径）——FileNotFoundError/OSError（数据文件缺失）、JSONDecodeError（数据损坏）、
+    # ValueError（_load_guides/_load_sops fail-closed 校验）均属运维层错误，归 INTERNAL_ERROR，
+    # 不误导调用方以为是入参不合法。
+    # BUG-62 后补：KeyError 也归 INTERNAL_ERROR——本包 [] 访问的键全部来自数据文件
+    # （entries/sops/id/source...），键缺失=服务端数据问题，而非客户端入参问题。
+    if isinstance(exc, (FileNotFoundError, OSError, json.JSONDecodeError, ValueError, KeyError)):
+        return {"ok": False, "error": "INTERNAL_ERROR", "detail": f"内部数据/环境错误：{exc}"}
     return {"ok": False, "error": "INVALID_INPUT", "detail": str(exc)}
 
 
