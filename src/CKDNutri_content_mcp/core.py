@@ -111,10 +111,13 @@ def search_guideline(query: str, guideline_set: Optional[str] = None) -> Dict[st
 
 
 def search_sop(query: str) -> Dict[str, Any]:
-    """检索院内 SOP。按调用方身份切语料视图：患儿返回安全摘要，不暴露完整临床处置（MX-1）。
+    """检索院内 SOP。按调用方身份切语料视图：非临床角色只返回安全/通俗版，不暴露完整临床处置。
 
-    语料视图由部署注入的身份决定（与 search_guideline 一致）；child 视图下仅返回 child 安全版，
-    缺字段时回退到 _CHILD_SOP_FALLBACK，绝不把完整临床处置下发给患儿。
+    语料视图由部署注入的身份决定（与 search_guideline 一致）。BUG-22 修复（2026-08-12）：
+    此前仅 view == "child" 返回安全版，家长（plain_language→popular）会落到 else 分支拿到
+    s["content"]（完整临床处置步骤，如高钾抢救流程）——已改为 fail-closed：
+    仅 full 视图返回完整 content；其余视图优先取对应字段（popular/child），
+    缺字段一律回退到 child 安全版（绝不把完整临床处置下发给非临床角色）。
     """
     caller = get_caller()
     enforce_read(MCP_NAME)
@@ -124,10 +127,11 @@ def search_sop(query: str) -> Dict[str, Any]:
     for s in sops["sops"]:
         hay = " ".join([s["title"], s["tags"].__str__(), s.get("child", ""), s["content"]])
         if _match(hay, query):
-            if view == "child":
-                content = s.get("child", _CHILD_SOP_FALLBACK)
-            else:
+            if view == "full":
                 content = s["content"]
+            else:
+                # BUG-22：非 full 视图优先取对应视图字段，缺则回退 child 安全版（fail-closed）
+                content = (s.get(view) or s.get("child")) or _CHILD_SOP_FALLBACK
             out.append({
                 "id": s["id"],
                 "title": s["title"],

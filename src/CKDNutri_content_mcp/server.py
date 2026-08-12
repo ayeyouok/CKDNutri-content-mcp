@@ -4,6 +4,7 @@
 
 v0.3.2 修复：search_guideline / search_sop / get_citation 此前工具名与导入的 core 函数
 同名导致无限递归（RecursionError），改为经 core 模块调用；generate_report 补齐 7 个必需参数。
+v0.3.9（BUG-16）修复：工具命名统一 _tool 后缀，与其他域包（*_tool）约定一致。
 """
 from __future__ import annotations
 
@@ -31,7 +32,7 @@ def main():
 # ---- M12: 循证知识库 ----
 
 @mcp.tool
-def search_guideline(keyword: str, guideline_set: Optional[str] = None) -> dict[str, Any]:
+def search_guideline_tool(keyword: str, guideline_set: Optional[str] = None) -> dict[str, Any]:
     """语义检索指南（按角色视图裁剪：临床=专业语料，家庭=通俗语料）。"""
     try:
         return _core.search_guideline(keyword, guideline_set)
@@ -40,7 +41,7 @@ def search_guideline(keyword: str, guideline_set: Optional[str] = None) -> dict[
 
 
 @mcp.tool
-def search_sop(keyword: str) -> dict[str, Any]:
+def search_sop_tool(keyword: str) -> dict[str, Any]:
     """检索临床 SOP。"""
     try:
         return _core.search_sop(keyword)
@@ -49,7 +50,7 @@ def search_sop(keyword: str) -> dict[str, Any]:
 
 
 @mcp.tool
-def get_citation(entry_id: str) -> dict[str, Any]:
+def get_citation_tool(entry_id: str) -> dict[str, Any]:
     """返回指定指南条目的完整出处。"""
     try:
         return _core.get_citation(entry_id)
@@ -60,7 +61,7 @@ def get_citation(entry_id: str) -> dict[str, Any]:
 # ---- M9: 报告生成 ----
 
 @mcp.tool
-def generate_report(
+def generate_report_tool(
     patient_id: str,
     demographics: dict,
     lab_summary: dict,
