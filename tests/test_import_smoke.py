@@ -27,7 +27,9 @@ def test_knowledge_search_and_report():
     from CKDNutri_content_mcp import core
 
     r = core.search_guideline("CKD")
-    assert r.get("count", 0) >= 0 and "view" in r
+    # S1（2026-08-12 五包审查）：统一 {ok, data} 信封——断言随契约更新
+    assert r.get("ok") is True and "view" in r["data"]
+    assert r["data"].get("count", 0) >= 0
 
     rep = core.generate_patient_report(
         patient_id="P001",
@@ -38,10 +40,48 @@ def test_knowledge_search_and_report():
         pew_history=[{"level": "low"}, {"level": "medium"}],
         risk_level="L2",
     )
-    assert rep.get("ok") is True and "sections" in rep
+    assert rep.get("ok") is True and "sections" in rep["data"]
+
+
+def test_guideline_set_validation():
+    """四审（2026-08-13）回归：guideline_set 大小写容错 + 非法值报错。"""
+    from CKDNutri_content_mcp import core
+
+    # 大小写不敏感：小写/混合大小写均归一化到规范名
+    for variant in ("KDIGO2024", "kdigo2024", "Kdigo2024"):
+        r = core.search_guideline("CKD", guideline_set=variant)
+        assert r.get("ok") is True, (variant, r)
+        sets = {e.get("set") for e in r["data"]["results"]}
+        assert sets <= {"KDIGO2024"}, (variant, sets)
+    # 非法值显式报错（fail-closed，此前静默返回空结果）
+    try:
+        core.search_guideline("CKD", guideline_set="WHO2020")
+    except ValueError as exc:
+        assert "WHO2020" in str(exc)
+    else:
+        raise AssertionError("非法 guideline_set 应抛 ValueError")
+    # 非字符串拒绝
+    try:
+        core.search_guideline("CKD", guideline_set=123)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("非字符串 guideline_set 应抛 ValueError")
+
+
+def test_empty_query_note():
+    """四审（2026-08-13）回归：空关键词显式提示（防"无匹配"与"没给关键词"混淆）。"""
+    from CKDNutri_content_mcp import core
+
+    for fn in (core.search_guideline, core.search_sop):
+        r = fn("   ")
+        assert r.get("ok") is True and r["data"]["count"] == 0
+        assert "关键词为空" in (r["data"].get("note") or ""), r["data"]
 
 
 if __name__ == "__main__":
     test_server_imports()
     test_knowledge_search_and_report()
+    test_guideline_set_validation()
+    test_empty_query_note()
     print("P5 SMOKE OK")

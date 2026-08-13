@@ -9,6 +9,7 @@ v0.3.9（BUG-16）修复：工具命名统一 _tool 后缀，与其他域包（*
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Optional
 
 from fastmcp import FastMCP
@@ -19,25 +20,36 @@ from . import core as _core
 
 mcp = FastMCP("CKDNutri-content-mcp")
 
+# B2（2026-08-12 五包审查）：异常分级归类统一到 care/assessment 口径——
+# 未知系统异常（内部 Code Bug）归 INTERNAL_ERROR 且 detail 脱敏，完整堆栈仅服务端日志。
+logger = logging.getLogger("CKDNutri-content-mcp")
+
 
 def _invalid(exc):
     if isinstance(exc, CallerError):
-        # BUG-54（2026-08-12）：越权/身份未解析统一返回 FORBIDDEN 信封（与 clinical-data
-        # _guard_access / care _guard 同格式），不再向上抛导致 500。此前本包 4 处裸调
-        # enforce_read 的读工具越权即 500 崩溃。PermissionDenied 带 caller/action/reason，
-        # CallerUnknown 缺字段时降级文案。
+        # BUG-54（2026-08-12）：越权/身份未解析统一返回 FORBIDDEN 信封，不再向上抛 500。
+        # 2026-08-12（七审，care 同口径）：caller/action/reason 三重 or 保底。
+        logger.warning("内容服务鉴权拒绝: exc=%s", exc)
+        caller = getattr(exc, "caller", None) or "?"
+        action = getattr(exc, "action", None) or "access"
+        reason = getattr(exc, "reason", None) or str(exc) or "无明确原因"
         return {"ok": False, "error": "FORBIDDEN",
-                "detail": f"caller={getattr(exc, 'caller', '?')} 无权 {getattr(exc, 'action', 'access')}"
-                          f"（{getattr(exc, 'reason', str(exc))}）"}
-    # BUG-56（2026-08-12）：区分"入参错误"与"内部数据/环境错误"（对齐 nutrition/care/assessment
-    # BUG-52 口径）——FileNotFoundError/OSError（数据文件缺失）、JSONDecodeError（数据损坏）、
-    # ValueError（_load_guides/_load_sops fail-closed 校验）均属运维层错误，归 INTERNAL_ERROR，
-    # 不误导调用方以为是入参不合法。
-    # BUG-62 后补：KeyError 也归 INTERNAL_ERROR——本包 [] 访问的键全部来自数据文件
-    # （entries/sops/id/source...），键缺失=服务端数据问题，而非客户端入参问题。
-    if isinstance(exc, (FileNotFoundError, OSError, json.JSONDecodeError, ValueError, KeyError)):
-        return {"ok": False, "error": "INTERNAL_ERROR", "detail": f"内部数据/环境错误：{exc}"}
-    return {"ok": False, "error": "INVALID_INPUT", "detail": str(exc)}
+                "detail": f"caller={caller} 无权 {action}（{reason}）"}
+    # BUG-56 + B2（2026-08-12）：数据/环境错误（文件缺失/JSON 损坏/_load_* fail-closed
+    # 校验）归 INTERNAL_ERROR 且 detail **脱敏**（不裸暴露 str(exc) 中的服务端路径），
+    # 完整异常仅留服务端日志。注意：本包的 ValueError 全部来自数据文件加载期校验
+    # （_load_guides/_load_sops 的 fail-closed），属服务端数据问题而非客户端入参问题，
+    # 故与 care/assessment 的"ValueError→INVALID_INPUT"语义不同，归 INTERNAL_ERROR。
+    # KeyError 亦归 INTERNAL_ERROR（[] 访问的键全部来自数据文件，键缺失=数据问题）。
+    if isinstance(exc, (FileNotFoundError, OSError, json.JSONDecodeError, RuntimeError,
+                        KeyError, ValueError)):
+        logger.warning("内容服务内部数据错误: %s", exc)
+        return {"ok": False, "error": "INTERNAL_ERROR",
+                "detail": "内部数据错误（error_code=CONTENT_DATA），详情见服务端日志"}
+    # 未知系统异常 = 内部 Code Bug——归 INTERNAL_ERROR（编排层不应重试/误判入参问题）
+    logger.error("内容服务未预期异常（内部 bug，error_code=CONTENT_UNKNOWN）", exc_info=exc)
+    return {"ok": False, "error": "INTERNAL_ERROR",
+            "detail": "内容服务内部错误（error_code=CONTENT_UNKNOWN），请查服务端日志"}
 
 
 def main():

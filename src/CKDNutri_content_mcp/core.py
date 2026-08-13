@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -43,6 +44,10 @@ _GUIDES: Optional[Dict[str, Any]] = None
 _SOPS: Optional[Dict[str, Any]] = None
 # BUG-66 后补（2026-08-12）：跨文件 id 唯一性校验结果缓存（get_citation 入口一次性校验）
 _CROSS_IDS_CHECKED = False
+# S3（2026-08-12 五包审查）：懒加载并发锁（double-checked locking，对齐 assessment
+# _RULES_LOCK）——FastMCP/多 worker 线程并发首次调用时防重复 I/O 与重复 JSON 解析。
+_GUIDES_LOCK = threading.Lock()
+_SOPS_LOCK = threading.Lock()
 
 
 def _validate_cross_file_ids() -> None:
@@ -70,74 +75,78 @@ def _validate_cross_file_ids() -> None:
 def _load_guides() -> Dict[str, Any]:
     global _GUIDES
     if _GUIDES is None:
-        with open(_GUIDE_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        # BUG-62 后补（2026-08-12）：顶层 'entries' 键校验，对齐 _load_sops 的 'sops' 校验——
-        # 此前 data["entries"] 直接索引，缺键/非列表在加载期抛 KeyError（虽已归 INTERNAL_ERROR，
-        # 但加载期显式 ValueError 更规范）。
-        if not isinstance(data.get("entries"), list):
-            raise ValueError("指南数据结构损坏：缺少 'entries' 列表，拒绝加载")
-        # OD-014（P2-4）：加载时校验语料视图字段完整性——缺任一视图字段直接报错，
-        # 而不是运行时回退到 full（fail-closed：宁可少给不可多给）。
-        # BUG-62：补基础元数据键校验（id/title/source/strength/evidence）——
-        # search_guideline/get_citation 直接访问这些键，缺键会在运行时 KeyError；
-        # "set" 经 .get 可选访问（guideline_set 过滤），不强制。
-        for e in data["entries"]:
-            # BUG-63（2026-08-12）：元素层 dict 校验——null/非 dict 混入时 e.get 抛
-            # AttributeError，加载期显式拒绝（fail-closed）。
-            if not isinstance(e, dict):
-                raise ValueError(f"指南 entries 含非字典元素：{e!r}，拒绝加载")
-            missing = [k for k in ("id", "title", "source", "strength", "evidence",
-                                   "full", "popular", "child")
-                       if not str(e.get(k) or "").strip()]
-            if missing:
-                raise ValueError(
-                    f"指南条目 {e.get('id', '?')} 缺少必填键 {missing}，"
-                    f"拒绝加载（fail-closed：防止家长/患儿回退到 full 临床语料）")
-        # BUG-66（2026-08-12）：文件内 id 唯一性校验——get_citation 按 id 查引用，
-        # 重复 id 会让引用解析返回首个匹配（不明确）；当前数据前缀已隔离（KDIGO2024-/
-        # PRNT2020-/SOP-），此校验为防未来数据引入重复 id 的 fail-closed 防御。
-        seen_ids: set[str] = set()
-        for e in data["entries"]:
-            eid = str(e.get("id") or "")
-            if eid in seen_ids:
-                raise ValueError(f"指南条目 id 重复：{eid!r}，拒绝加载（get_citation 需 id 唯一）")
-            seen_ids.add(eid)
-        _GUIDES = data
+        with _GUIDES_LOCK:
+            if _GUIDES is None:  # S3：double-checked locking（对齐 assessment _RULES_LOCK）
+                with open(_GUIDE_PATH, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                # BUG-62 后补（2026-08-12）：顶层 'entries' 键校验，对齐 _load_sops 的 'sops' 校验——
+                # 此前 data["entries"] 直接索引，缺键/非列表在加载期抛 KeyError（虽已归 INTERNAL_ERROR，
+                # 但加载期显式 ValueError 更规范）。
+                if not isinstance(data.get("entries"), list):
+                    raise ValueError("指南数据结构损坏：缺少 'entries' 列表，拒绝加载")
+                # OD-014（P2-4）：加载时校验语料视图字段完整性——缺任一视图字段直接报错，
+                # 而不是运行时回退到 full（fail-closed：宁可少给不可多给）。
+                # BUG-62：补基础元数据键校验（id/title/source/strength/evidence）——
+                # search_guideline/get_citation 直接访问这些键，缺键会在运行时 KeyError；
+                # "set" 经 .get 可选访问（guideline_set 过滤），不强制。
+                for e in data["entries"]:
+                    # BUG-63（2026-08-12）：元素层 dict 校验——null/非 dict 混入时 e.get 抛
+                    # AttributeError，加载期显式拒绝（fail-closed）。
+                    if not isinstance(e, dict):
+                        raise ValueError(f"指南 entries 含非字典元素：{e!r}，拒绝加载")
+                    missing = [k for k in ("id", "title", "source", "strength", "evidence",
+                                           "full", "popular", "child")
+                               if not str(e.get(k) or "").strip()]
+                    if missing:
+                        raise ValueError(
+                            f"指南条目 {e.get('id', '?')} 缺少必填键 {missing}，"
+                            f"拒绝加载（fail-closed：防止家长/患儿回退到 full 临床语料）")
+                # BUG-66（2026-08-12）：文件内 id 唯一性校验——get_citation 按 id 查引用，
+                # 重复 id 会让引用解析返回首个匹配（不明确）；当前数据前缀已隔离（KDIGO2024-/
+                # PRNT2020-/SOP-），此校验为防未来数据引入重复 id 的 fail-closed 防御。
+                seen_ids: set[str] = set()
+                for e in data["entries"]:
+                    eid = str(e.get("id") or "")
+                    if eid in seen_ids:
+                        raise ValueError(f"指南条目 id 重复：{eid!r}，拒绝加载（get_citation 需 id 唯一）")
+                    seen_ids.add(eid)
+                _GUIDES = data
     return _GUIDES
 
 
 def _load_sops() -> Dict[str, Any]:
     global _SOPS
     if _SOPS is None:
-        with open(_SOP_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        # BUG-56（2026-08-12）：参照 _load_guides 做加载时结构校验（fail-closed）——
-        # 缺必填键直接拒绝加载，避免检索期运行 KeyError。
-        # BUG-62 后补（2026-08-12）：顶层 'sops' 键缺失/非列表也要拒绝——此前
-        # data.get("sops", []) 对缺键静默返回 []，随后 search_sop 的 sops["sops"]
-        # 运行时 KeyError；非列表（如 dict）会迭代出字符串键导致 AttributeError。
-        if not isinstance(data.get("sops"), list):
-            raise ValueError("SOP 数据结构损坏：缺少 'sops' 列表，拒绝加载")
-        for s in data["sops"]:
-            # BUG-63（2026-08-12）：元素层 dict 校验（对齐 _load_guides）——null/非 dict
-            # 混入时 s.get 抛 AttributeError。
-            if not isinstance(s, dict):
-                raise ValueError(f"SOP sops 含非字典元素：{s!r}，拒绝加载")
-            missing = [k for k in ("id", "title", "content", "source")
-                       if not str(s.get(k) or "").strip()]
-            if missing:
-                raise ValueError(
-                    f"SOP 条目 {s.get('id', '?')} 缺少必填键 {missing}，拒绝加载"
-                    f"（fail-closed：防止检索期 KeyError / 下发不完整处置）")
-        # BUG-66（2026-08-12）：文件内 id 唯一性校验（与 _load_guides 同口径）
-        seen_ids: set[str] = set()
-        for s in data["sops"]:
-            sid = str(s.get("id") or "")
-            if sid in seen_ids:
-                raise ValueError(f"SOP 条目 id 重复：{sid!r}，拒绝加载（get_citation 需 id 唯一）")
-            seen_ids.add(sid)
-        _SOPS = data
+        with _SOPS_LOCK:
+            if _SOPS is None:  # S3：double-checked locking（对齐 assessment _RULES_LOCK）
+                with open(_SOP_PATH, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                # BUG-56（2026-08-12）：参照 _load_guides 做加载时结构校验（fail-closed）——
+                # 缺必填键直接拒绝加载，避免检索期运行 KeyError。
+                # BUG-62 后补（2026-08-12）：顶层 'sops' 键缺失/非列表也要拒绝——此前
+                # data.get("sops", []) 对缺键静默返回 []，随后 search_sop 的 sops["sops"]
+                # 运行时 KeyError；非列表（如 dict）会迭代出字符串键导致 AttributeError。
+                if not isinstance(data.get("sops"), list):
+                    raise ValueError("SOP 数据结构损坏：缺少 'sops' 列表，拒绝加载")
+                for s in data["sops"]:
+                    # BUG-63（2026-08-12）：元素层 dict 校验（对齐 _load_guides）——null/非 dict
+                    # 混入时 s.get 抛 AttributeError。
+                    if not isinstance(s, dict):
+                        raise ValueError(f"SOP sops 含非字典元素：{s!r}，拒绝加载")
+                    missing = [k for k in ("id", "title", "content", "source")
+                               if not str(s.get(k) or "").strip()]
+                    if missing:
+                        raise ValueError(
+                            f"SOP 条目 {s.get('id', '?')} 缺少必填键 {missing}，拒绝加载"
+                            f"（fail-closed：防止检索期 KeyError / 下发不完整处置）")
+                # BUG-66（2026-08-12）：文件内 id 唯一性校验（与 _load_guides 同口径）
+                seen_ids: set[str] = set()
+                for s in data["sops"]:
+                    sid = str(s.get("id") or "")
+                    if sid in seen_ids:
+                        raise ValueError(f"SOP 条目 id 重复：{sid!r}，拒绝加载（get_citation 需 id 唯一）")
+                    seen_ids.add(sid)
+                _SOPS = data
     return _SOPS
 
 
@@ -156,17 +165,56 @@ def _match(text: str, query: str) -> bool:
     return q in text.lower()
 
 
+def _guideline_set_lookup() -> Dict[str, str]:
+    """指南 set 合法值（加载期从数据收集，防硬编码漂移）→ 小写名 → 规范名。"""
+    guides = _load_guides()
+    return {
+        str(e.get("set") or "").strip().lower(): str(e.get("set")).strip()
+        for e in guides["entries"] if e.get("set")
+    }
+
+
+def _validate_guideline_set(guideline_set: Optional[str]) -> Optional[str]:
+    """guideline_set 校验 + 大小写容错（四审，2026-08-12）。
+
+    - 非字符串/空串 → ValueError（fail-closed，防 TypeError 冒泡归 INTERNAL_ERROR）；
+    - 大小写容错：用户传 "kdigo2024"/"CHINA2023" 归一化到数据规范名（此前严格
+      区分大小写，"kdigo2024" 静默返回空结果，无任何提示）；
+    - 非法值 → ValueError 显式报错并列出可用集合（此前静默返回 count=0，LLM 会
+      误以为"该集无内容"）。
+    """
+    if guideline_set is None:
+        return None
+    if not isinstance(guideline_set, str) or not guideline_set.strip():
+        raise ValueError("guideline_set 必须为非空字符串")
+    lookup = _guideline_set_lookup()
+    canon = lookup.get(guideline_set.strip().lower())
+    if canon is None:
+        raise ValueError(
+            f"guideline_set={guideline_set!r} 非法，可用：{sorted(set(lookup.values()))}")
+    return canon
+
+
 def search_guideline(query: str, guideline_set: Optional[str] = None) -> Dict[str, Any]:
     """检索指南/共识条文。按调用方身份切语料视图；所有结果带 source 出处。
 
     语料视图由部署注入的身份决定（doctor_assistant/nutritionist/risk_warning=全量 full；
     parent_assistant=popular 通俗；child_companion=child 科普），调用方不可自选。
-    guideline_set: 可选过滤 KDIGO2024/PRNT2020/China2023/Growth2025。
+    guideline_set: 可选过滤 KDIGO2024/PRNT2020/China2023/Growth2025（大小写不敏感，
+    非法值显式报错）。空 query 返回空结果并提示（不执行检索）。
     """
     caller = get_caller()
     enforce_read(MCP_NAME)
+    # 四审（2026-08-12）：guideline_set 校验（大小写容错 + 枚举报错）
+    guideline_set = _validate_guideline_set(guideline_set)
     guides = _load_guides()
     view = _view_for_caller(caller)
+    # 四审（2026-08-12）：空关键词显式提示——此前返回 count=0 无解释，LLM 无法区分
+    # "无匹配"与"没给关键词"。
+    if not (query or "").strip():
+        return {"ok": True, "data": {
+            "query": query, "role": caller, "view": view, "count": 0, "results": [],
+            "note": "查询关键词为空，未执行检索；请提供有效关键词。"}}
     out = []
     for e in guides["entries"]:
         if guideline_set and e.get("set") != guideline_set:
@@ -194,7 +242,13 @@ def search_guideline(query: str, guideline_set: Optional[str] = None) -> Dict[st
             "text": e.get(view, ""),
             "source": e["source"],
         })
-    return {"query": query, "role": caller, "view": view, "count": len(out), "results": out}
+    # S1（2026-08-12 五包审查）：统一 {ok, data} 信封——此前扁平结构
+    # （{"query", "role", "view", "count", "results"}）与其余四包契约分裂，
+    # 编排层无法统一按 ok/data 解析。数据形状不变，仅包信封。
+    return {"ok": True, "data": {
+        "query": query, "role": caller, "view": view,
+        "count": len(out), "results": out,
+    }}
 
 
 def search_sop(query: str) -> Dict[str, Any]:
@@ -210,6 +264,11 @@ def search_sop(query: str) -> Dict[str, Any]:
     enforce_read(MCP_NAME)
     view = _view_for_caller(caller)
     sops = _load_sops()
+    # 四审（2026-08-12）：空关键词显式提示（与 search_guideline 同口径）
+    if not (query or "").strip():
+        return {"ok": True, "data": {
+            "query": query, "count": 0, "results": [],
+            "note": "查询关键词为空，未执行检索；请提供有效关键词。"}}
     out = []
     for s in sops["sops"]:
         # BUG-56（2026-08-12）：hay 只拼当前视图可见文本（消除幻影匹配）；tags 规范 join；
@@ -233,7 +292,8 @@ def search_sop(query: str) -> Dict[str, Any]:
                 "source": s["source"],
                 "view": view,
             })
-    return {"query": query, "count": len(out), "results": out}
+    # S1（2026-08-12 五包审查）：统一 {ok, data} 信封（与 search_guideline 同口径）
+    return {"ok": True, "data": {"query": query, "count": len(out), "results": out}}
 
 
 def get_citation(ref_id: str) -> Dict[str, Any]:
@@ -252,14 +312,19 @@ def get_citation(ref_id: str) -> Dict[str, Any]:
         if e["id"] == ref_id:
             citation = (f"[{e['id']}] {e['title']}. {e['source']} "
                         f"（推荐强度：{e['strength']}；证据级别：{e['evidence']}）")
-            return {"ref_id": ref_id, "citation": citation, "source": e["source"],
-                    "strength": e["strength"], "evidence": e["evidence"]}
+            return {"ok": True, "data": {"ref_id": ref_id, "citation": citation,
+                                         "source": e["source"], "strength": e["strength"],
+                                         "evidence": e["evidence"]}}
     sops = _load_sops()
     for s in sops["sops"]:
         if s["id"] == ref_id:
             citation = f"[{s['id']}] {s['title']}. {s['source']}"
-            return {"ref_id": ref_id, "citation": citation, "source": s["source"]}
-    return {"ref_id": ref_id, "citation": None, "error": "未找到该引用 ID"}
+            return {"ok": True, "data": {"ref_id": ref_id, "citation": citation,
+                                         "source": s["source"]}}
+    # S1（2026-08-12 五包审查）：统一 {ok, data} 信封——未找到由扁平 error 字段改为
+    # 标准 {ok: false, error: NOT_FOUND, detail} 失败信封（编排层可统一按 ok 分支）。
+    return {"ok": False, "error": "NOT_FOUND",
+            "detail": f"未找到引用 ID：{ref_id}", "ref_id": ref_id}
 
 
 def _self_test_refs() -> List[str]:
@@ -276,6 +341,9 @@ _RISK_TO_STATUS = {
     "L2": "caution", "L3": "caution", "medium": "caution", "caution": "caution",
     "L0": "stable", "low": "stable", "none": "stable", "stable": "stable",
 }
+# 💭（2026-08-12 五包审查）：状态中文映射前移至常量区（此前定义在使用点之后，
+# 依赖模块级运行时查找，可读性差）。
+_STATUS_CN = {"stable": "稳定", "caution": "需关注", "critical": "紧急"}
 
 
 # BUG-62/BUG-63（2026-08-12）：等级阶梯——L0(0) < L3(1) < L2(2) < L1(3)，
@@ -504,18 +572,19 @@ def generate_patient_report(patient_id: str, demographics: dict, lab_summary: di
     lines.append(_section("六、风险等级（M8）", f"- 等级：{risk_level}"))
     lines.append(_section("七、综合结论", f"**整体状态：{_STATUS_CN.get(overall_status, overall_status)}**"))
 
+    # S1（2026-08-12 五包审查）：统一 {ok, data} 信封——此前 {ok, patient_id, ...} 平铺
+    # 无 data 包裹，与其余四包契约分裂；编排层可统一按 data 取业务字段。
     return {
         "ok": True,
-        "patient_id": patient_id,
-        "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-        "overall_status": overall_status,
-        "pew_trend": trend,
-        "sections": sections,
-        "summary_markdown": "\n".join(lines),
+        "data": {
+            "patient_id": patient_id,
+            "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "overall_status": overall_status,
+            "pew_trend": trend,
+            "sections": sections,
+            "summary_markdown": "\n".join(lines),
+        },
     }
-
-
-_STATUS_CN = {"stable": "稳定", "caution": "需关注", "critical": "紧急"}
 
 
 def _fmt_dict(d: Any) -> str:
