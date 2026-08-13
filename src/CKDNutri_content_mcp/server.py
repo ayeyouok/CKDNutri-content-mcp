@@ -59,19 +59,21 @@ def main():
 # ---- M12: 循证知识库 ----
 
 @mcp.tool
-def search_guideline_tool(keyword: str, guideline_set: Optional[str] = None) -> dict[str, Any]:
-    """语义检索指南（按角色视图裁剪：临床=专业语料，家庭=通俗语料）。"""
+def search_guideline_tool(keyword: str, guideline_set: Optional[str] = None,
+                          limit: int = 20) -> dict[str, Any]:
+    """语义检索指南（按角色视图裁剪：临床=专业语料，家庭=通俗语料）。
+    limit（P2 修复 2026-08-13）：结果上限（默认 20、上限 100），防全量命中灌爆上下文。"""
     try:
-        return _core.search_guideline(keyword, guideline_set)
+        return _core.search_guideline(keyword, guideline_set, limit=limit)
     except Exception as exc:
         return _invalid(exc)
 
 
 @mcp.tool
-def search_sop_tool(keyword: str) -> dict[str, Any]:
-    """检索临床 SOP。"""
+def search_sop_tool(keyword: str, limit: int = 20) -> dict[str, Any]:
+    """检索临床 SOP。limit（P2 修复）：结果上限（默认 20、上限 100）。"""
     try:
-        return _core.search_sop(keyword)
+        return _core.search_sop(keyword, limit=limit)
     except Exception as exc:
         return _invalid(exc)
 

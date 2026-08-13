@@ -21,6 +21,7 @@ from a207_policy import (
     enforce_read,
     get_caller,
     knowledge_profile,
+    validate_patient_id,
 )
 
 # 本包在权限矩阵中的登记名（enforce_* 查表键，唯一事实源在 a207_policy.matrix）。
@@ -195,13 +196,16 @@ def _validate_guideline_set(guideline_set: Optional[str]) -> Optional[str]:
     return canon
 
 
-def search_guideline(query: str, guideline_set: Optional[str] = None) -> Dict[str, Any]:
+def search_guideline(query: str, guideline_set: Optional[str] = None,
+                     limit: int = 20) -> Dict[str, Any]:
     """检索指南/共识条文。按调用方身份切语料视图；所有结果带 source 出处。
 
     语料视图由部署注入的身份决定（doctor_assistant/nutritionist/risk_warning=全量 full；
     parent_assistant=popular 通俗；child_companion=child 科普），调用方不可自选。
     guideline_set: 可选过滤 KDIGO2024/PRNT2020/China2023/Growth2025（大小写不敏感，
     非法值显式报错）。空 query 返回空结果并提示（不执行检索）。
+    limit（P2 修复 2026-08-13）：结果上限钳制（默认 20、上限 100）——指南库数百条
+    全量命中会灌爆 LLM 上下文，超限截断并标注 truncated。
     """
     caller = get_caller()
     enforce_read(MCP_NAME)
@@ -245,13 +249,21 @@ def search_guideline(query: str, guideline_set: Optional[str] = None) -> Dict[st
     # S1（2026-08-12 五包审查）：统一 {ok, data} 信封——此前扁平结构
     # （{"query", "role", "view", "count", "results"}）与其余四包契约分裂，
     # 编排层无法统一按 ok/data 解析。数据形状不变，仅包信封。
+    # P2 修复（2026-08-13）：limit 钳制——指南库命中可能数百条，全量进上下文
+    # 浪费 token；默认 20、上限 100，超限截断并标注 truncated=true。
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise ValueError("limit 必须为 ≥1 的整数")
+    limit = min(limit, 100)
+    truncated = len(out) > limit
     return {"ok": True, "data": {
         "query": query, "role": caller, "view": view,
-        "count": len(out), "results": out,
+        "count": len(out), "results": out[:limit],
+        "truncated": truncated,
+        "note": f"命中 {len(out)} 条，已截断返回前 {limit} 条（limit={limit}）" if truncated else None,
     }}
 
 
-def search_sop(query: str) -> Dict[str, Any]:
+def search_sop(query: str, limit: int = 20) -> Dict[str, Any]:
     """检索院内 SOP。按调用方身份切语料视图：非临床角色只返回安全/通俗版，不暴露完整临床处置。
 
     语料视图由部署注入的身份决定（与 search_guideline 一致）。BUG-22 修复（2026-08-12）：
@@ -259,6 +271,7 @@ def search_sop(query: str) -> Dict[str, Any]:
     s["content"]（完整临床处置步骤，如高钾抢救流程）——已改为 fail-closed：
     仅 full 视图返回完整 content；其余视图优先取对应字段（popular/child），
     缺字段一律回退到 child 安全版（绝不把完整临床处置下发给非临床角色）。
+    limit（P2 修复 2026-08-13）：结果上限钳制（默认 20、上限 100，超限截断标注）。
     """
     caller = get_caller()
     enforce_read(MCP_NAME)
@@ -293,7 +306,15 @@ def search_sop(query: str) -> Dict[str, Any]:
                 "view": view,
             })
     # S1（2026-08-12 五包审查）：统一 {ok, data} 信封（与 search_guideline 同口径）
-    return {"ok": True, "data": {"query": query, "count": len(out), "results": out}}
+    # P2 修复（2026-08-13）：limit 钳制（默认 20、上限 100，超限截断标注 truncated）
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise ValueError("limit 必须为 ≥1 的整数")
+    limit = min(limit, 100)
+    truncated = len(out) > limit
+    return {"ok": True, "data": {"query": query, "count": len(out), "results": out[:limit],
+                                 "truncated": truncated,
+                                 "note": (f"命中 {len(out)} 条，已截断返回前 {limit} 条"
+                                          f"（limit={limit}）" if truncated else None)}}
 
 
 def get_citation(ref_id: str) -> Dict[str, Any]:
@@ -487,6 +508,11 @@ def generate_patient_report(patient_id: str, demographics: dict, lab_summary: di
     """
     caller = get_caller()
     enforce_read(MCP_NAME)
+    # N1 修复（2026-08-13）：统一 patient_id 契约校验（畸形 id 不进报告生成）
+    try:
+        patient_id = validate_patient_id(patient_id)
+    except ValueError as exc:
+        return {"ok": False, "error": "INVALID_ARGUMENT", "detail": str(exc)}
     # BUG-62 后补（2026-08-12）：顶层防空——编排层直调可能传 None（fastmcp 工具层对
     # 必填 dict 形参可能放行显式 null），demographics=None 会在下方 .get() 抛
     # AttributeError。统一 `or {}` 兜底，None/空按无数据处理。
@@ -503,6 +529,12 @@ def generate_patient_report(patient_id: str, demographics: dict, lab_summary: di
     pew_info = _pew_trend_info(ph)
     trend = pew_info["trend"]
     overall_status = _derive_status(risk_level, ph, nutrition_assessment, pew_trend=trend)
+    # 六审（2026-08-13）：未知风险等级显式标注——_derive_status 对非法 risk_level
+    # 静默归 stable（fail-open 掩盖真实风险，如 "L9" 会被展示为"稳定"），报告必须
+    # 透明化：未知等级标注 risk.valid=false 并在 markdown 中提示核对上游。
+    rl_norm = re.sub(r"[^a-z0-9]", "", str(risk_level or "").lower())
+    risk_unknown = rl_norm not in ("l0", "l1", "l2", "l3", "low", "medium", "high",
+                                   "critical", "caution", "stable", "none")
     # MX-1：家长/患儿（非临床角色）拿受限视图 —— sections 与 summary_markdown 一致脱敏，
     # 避免经结构化章节泄露原始化验值（红队 C8：原仅脱敏 summary，sections 仍透出 raw scr/k）。
     mask = caller in _NON_CLINICAL_MASKED
@@ -527,7 +559,10 @@ def generate_patient_report(patient_id: str, demographics: dict, lab_summary: di
             "note": (f"趋势基于 {pew_info['valid_count']}/{pew_info['total_count']} 条有效记录"
                      if pew_info["valid_count"] < pew_info["total_count"] else "全部记录有效"),
         },
-        "risk": {"level": risk_level},
+        "risk": {"level": risk_level,
+                 # 六审（2026-08-13）：未知等级显式标注——_derive_status 对非法
+                 # risk_level 静默归 stable（fail-open 掩盖真实风险），报告必须透明。
+                 "valid": not risk_unknown},
         "overall_status": overall_status,
     }
 
@@ -569,7 +604,11 @@ def generate_patient_report(patient_id: str, demographics: dict, lab_summary: di
         f"- 历史点数：{pew_info['valid_count']}/{pew_info['total_count']}（有效/总数）　趋势：{trend}"
         + (f"\n- 提示：{invalid_count} 条记录日期格式无效，未参与趋势计算"
            if pew_info["valid_count"] < pew_info["total_count"] else "")))
-    lines.append(_section("六、风险等级（M8）", f"- 等级：{risk_level}"))
+    # 六审：未知风险等级在 markdown 中显式提示（不静默展示为"稳定"）
+    risk_line = f"- 等级：{risk_level}"
+    if risk_unknown:
+        risk_line += "（⚠ 无法解析的风险等级，整体状态按保守口径展示，请核对上游 M8 输出）"
+    lines.append(_section("六、风险等级（M8）", risk_line))
     lines.append(_section("七、综合结论", f"**整体状态：{_STATUS_CN.get(overall_status, overall_status)}**"))
 
     # S1（2026-08-12 五包审查）：统一 {ok, data} 信封——此前 {ok, patient_id, ...} 平铺

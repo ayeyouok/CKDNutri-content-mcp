@@ -32,7 +32,7 @@ def test_knowledge_search_and_report():
     assert r["data"].get("count", 0) >= 0
 
     rep = core.generate_patient_report(
-        patient_id="P001",
+        patient_id="P0001",
         demographics={"age_years": 6, "sex": "M", "ckd_stage": 3, "dialysis_mode": "none"},
         lab_summary={"scr_umol_L": 120, "k_mmol_L": 4.5, "albumin_g_L": 38},
         nutrition_assessment={"intake": {"achievement": {"energy_pct": 82}}},
@@ -69,6 +69,35 @@ def test_guideline_set_validation():
         raise AssertionError("非字符串 guideline_set 应抛 ValueError")
 
 
+def test_unknown_risk_level_transparency():
+    """N3 修复回归（2026-08-13）：未知 risk_level 必须透明标注，不得静默归 stable。
+
+    六审逻辑：_derive_status 对非法等级（如 "L9"）fail-open 归 stable——报告必须
+    在 risk.valid=false + markdown 中提示核对上游，防"未知风险被展示为稳定"。
+    """
+    from CKDNutri_content_mcp import core
+
+    base = dict(
+        patient_id="P0001",
+        demographics={"age_years": 6, "sex": "M", "ckd_stage": 3, "dialysis_mode": "none"},
+        lab_summary={"scr_umol_L": 120},
+        nutrition_assessment={"intake": {}},
+        followup_summary={"records": [], "adherence": [], "plans": []},
+        pew_history=[],
+    )
+    # 未知等级 → risk.valid=false + markdown 提示核对
+    bad = core.generate_patient_report(**base, risk_level="L9")
+    assert bad["ok"] is True, bad
+    assert bad["data"]["sections"]["risk"]["valid"] is False, bad["data"]["sections"]["risk"]
+    assert "核对" in bad["data"]["summary_markdown"], bad["data"]["summary_markdown"][:300]
+    # 已知等级 → risk.valid=true（不误伤）
+    ok = core.generate_patient_report(**base, risk_level="L2")
+    assert ok["data"]["sections"]["risk"]["valid"] is True, ok["data"]["sections"]["risk"]
+    # 空等级同样透明（"" → 未知）
+    none = core.generate_patient_report(**base, risk_level="")
+    assert none["data"]["sections"]["risk"]["valid"] is False
+
+
 def test_empty_query_note():
     """四审（2026-08-13）回归：空关键词显式提示（防"无匹配"与"没给关键词"混淆）。"""
     from CKDNutri_content_mcp import core
@@ -79,9 +108,48 @@ def test_empty_query_note():
         assert "关键词为空" in (r["data"].get("note") or ""), r["data"]
 
 
+def test_s4_parent_masking():
+    """S4/P0-4（2026-08-13）家长视图脱敏：**化验数值保留、临床判读裁切**。
+
+    2026-08-13 用户决策：家长对化验原始数值有知情权（P1 get_labs 返回 parent_full），
+    "数值给、判读不给"。CLINICIAN_ONLY_FIELDS 已重定义为纯判读字段（医生备注/EMR 状态/
+    Z 分/分期确认/危急值标记/等级修正）——家长报告应**含化验数值**、不含判读字段。
+    """
+    import json
+
+    from CKDNutri_content_mcp import core
+
+    os.environ["A207_CALLER"] = "parent_assistant"
+    try:
+        rep = core.generate_patient_report(
+            patient_id="P0001",
+            demographics={"age_years": 6, "sex": "M", "ckd_stage": 3, "dialysis_mode": "none"},
+            lab_summary={"scr_umol_L": 120, "k_mmol_L": 4.5, "albumin_g_L": 38},
+            nutrition_assessment={"intake": {"achievement": {"energy_pct": 82}}},
+            followup_summary={"records": [{"date": "2026-08-01"}],
+                              "adherence": [{"score": 0.9}], "plans": [1]},
+            pew_history=[{"level": "low"}],
+            risk_level="L2",
+        )
+    finally:
+        os.environ["A207_CALLER"] = "doctor_assistant"
+    assert rep.get("ok") is True, rep
+    snap = json.dumps(rep["data"], ensure_ascii=False)
+    # ① 化验数值对家长可见（知情权决策）：scr/k/albumin 值应存在
+    for leak in ("120", "4.5", "38"):
+        assert leak in snap, f"家长视图缺失化验数值（决策要求可见）: {leak}"
+    # ② 临床判读字段绝不可见（CLINICIAN_ONLY_FIELDS 重定义后）：
+    #    医生备注/EMR 状态/危急值标记/Z 分/分期确认
+    for hidden in ("doctor_notes", "note_to_clinician", "emr_status", "push_to_emr",
+                   "z_score_height", "stage_confirmed_by", "critical_flag"):
+        assert hidden not in snap, f"家长视图泄露临床判读字段: {hidden}"
+
+
 if __name__ == "__main__":
     test_server_imports()
     test_knowledge_search_and_report()
     test_guideline_set_validation()
+    test_unknown_risk_level_transparency()
     test_empty_query_note()
+    test_s4_parent_masking()
     print("P5 SMOKE OK")
