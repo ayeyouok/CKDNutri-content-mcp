@@ -175,23 +175,34 @@ def _guideline_set_lookup() -> Dict[str, str]:
     }
 
 
+class InvalidArgumentError(ValueError):
+    """客户端入参错误（CT-B2/B4 修复，2026-08-14）。
+
+    与数据文件加载期 ValueError（_load_guides/_load_sops 的 fail-closed，服务端数据
+    问题→INTERNAL_ERROR）区分：本异常由**调用方入参**触发（guideline_set 非法、
+    limit 非法、query 非字符串等），server 层归 INVALID_INPUT 而非 INTERNAL_ERROR，
+    避免把客户端错误误导成"内部数据错误"。
+    """
+
+
 def _validate_guideline_set(guideline_set: Optional[str]) -> Optional[str]:
     """guideline_set 校验 + 大小写容错（四审，2026-08-12）。
 
-    - 非字符串/空串 → ValueError（fail-closed，防 TypeError 冒泡归 INTERNAL_ERROR）；
+    - 非字符串/空串 → InvalidArgumentError（fail-closed，防 TypeError 冒泡归
+      INTERNAL_ERROR；CT-B2 修复后归 INVALID_INPUT）；
     - 大小写容错：用户传 "kdigo2024"/"CHINA2023" 归一化到数据规范名（此前严格
       区分大小写，"kdigo2024" 静默返回空结果，无任何提示）；
-    - 非法值 → ValueError 显式报错并列出可用集合（此前静默返回 count=0，LLM 会
-      误以为"该集无内容"）。
+    - 非法值 → InvalidArgumentError 显式报错并列出可用集合（此前静默返回 count=0，
+      LLM 会误以为"该集无内容"）。
     """
     if guideline_set is None:
         return None
     if not isinstance(guideline_set, str) or not guideline_set.strip():
-        raise ValueError("guideline_set 必须为非空字符串")
+        raise InvalidArgumentError("guideline_set 必须为非空字符串")
     lookup = _guideline_set_lookup()
     canon = lookup.get(guideline_set.strip().lower())
     if canon is None:
-        raise ValueError(
+        raise InvalidArgumentError(
             f"guideline_set={guideline_set!r} 非法，可用：{sorted(set(lookup.values()))}")
     return canon
 
@@ -209,6 +220,13 @@ def search_guideline(query: str, guideline_set: Optional[str] = None,
     """
     caller = get_caller()
     enforce_read(MCP_NAME)
+    # CT-B2/B4 修复（2026-08-14）：query 类型校验（此前 keyword=123 → query.strip()
+    # AttributeError 归 INTERNAL_ERROR 误导排障）+ limit 入参校验（非法归
+    # INVALID_INPUT 而非 INTERNAL_ERROR）
+    if not isinstance(query, str):
+        raise InvalidArgumentError(f"query 必须为字符串，收到 {type(query).__name__}")
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise InvalidArgumentError("limit 必须为 ≥1 的整数")
     # 四审（2026-08-12）：guideline_set 校验（大小写容错 + 枚举报错）
     guideline_set = _validate_guideline_set(guideline_set)
     guides = _load_guides()
@@ -218,6 +236,9 @@ def search_guideline(query: str, guideline_set: Optional[str] = None,
     if not (query or "").strip():
         return {"ok": True, "data": {
             "query": query, "role": caller, "view": view, "count": 0, "results": [],
+            # CT-B1（2026-08-14）：空分支补 truncated（与正常分支信封键一致，
+            # 编排层无需区分空/非空两种形状）
+            "truncated": False,
             "note": "查询关键词为空，未执行检索；请提供有效关键词。"}}
     out = []
     for e in guides["entries"]:
@@ -275,12 +296,20 @@ def search_sop(query: str, limit: int = 20) -> Dict[str, Any]:
     """
     caller = get_caller()
     enforce_read(MCP_NAME)
+    # CT-B2/B4 修复（2026-08-14）：query 类型 + limit 入参校验（归 INVALID_INPUT）
+    if not isinstance(query, str):
+        raise InvalidArgumentError(f"query 必须为字符串，收到 {type(query).__name__}")
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise InvalidArgumentError("limit 必须为 ≥1 的整数")
     view = _view_for_caller(caller)
     sops = _load_sops()
     # 四审（2026-08-12）：空关键词显式提示（与 search_guideline 同口径）
     if not (query or "").strip():
         return {"ok": True, "data": {
             "query": query, "count": 0, "results": [],
+            # CT-B1（2026-08-14）：补 view（与 search_guideline 信封一致，编排层统一
+            # 取 data.view；此前 SOP 的 view 只出现在结果条目层，形状分裂）
+            "view": view, "truncated": False,
             "note": "查询关键词为空，未执行检索；请提供有效关键词。"}}
     out = []
     for s in sops["sops"]:
@@ -629,13 +658,40 @@ def generate_patient_report(patient_id: str, demographics: dict, lab_summary: di
 def _fmt_dict(d: Any) -> str:
     # BUG-56（2026-08-12）：None 返回 "" 而非 "None"——否则 "None" or "（无）" 会渲染出
     # "二、最新化验：None" 而非预期的 "（无）"。
+    # CT-Q1 修复（2026-08-14）：**嵌套 dict/list 递归格式化**——此前 f"- {k}：{v}"
+    # 对嵌套结构直接 str(v) → Python repr（{'achievement': {...}}）渲染进家长报告，
+    # PII 文本与机器可读 repr 混入 markdown。递归后嵌套键渲染为缩进子列表。
     if d is None:
         return ""
-    if not isinstance(d, dict):
-        return str(d)
-    if not d:
+    if isinstance(d, dict):
+        if not d:
+            return ""
+        lines = []
+        for k, v in d.items():
+            if isinstance(v, dict):
+                inner = _fmt_dict(v)
+                lines.append(f"- {k}：{inner if inner else '（无）'}")
+            elif isinstance(v, (list, tuple)):
+                inner = _fmt_list(v)
+                lines.append(f"- {k}：{inner if inner else '（无）'}")
+            else:
+                lines.append(f"- {k}：{v}")
+        return "\n".join(lines)
+    return str(d)
+
+
+def _fmt_list(items: Any) -> str:
+    """列表递归渲染：元素为 dict → 递归 _fmt_dict；标量 → 顿号拼接。"""
+    if not items:
         return ""
-    return "\n".join(f"- {k}：{v}" for k, v in d.items())
+    parts = []
+    for it in items:
+        if isinstance(it, dict):
+            inner = _fmt_dict(it)
+            parts.append(inner if inner else "（无）")
+        else:
+            parts.append(str(it))
+    return "；".join(parts)
 
 
 def _fmt_block(d: Any) -> str:

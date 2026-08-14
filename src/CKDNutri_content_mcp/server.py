@@ -41,6 +41,12 @@ def _invalid(exc):
     # （_load_guides/_load_sops 的 fail-closed），属服务端数据问题而非客户端入参问题，
     # 故与 care/assessment 的"ValueError→INVALID_INPUT"语义不同，归 INTERNAL_ERROR。
     # KeyError 亦归 INTERNAL_ERROR（[] 访问的键全部来自数据文件，键缺失=数据问题）。
+    # CT-B2/B4 修复（2026-08-14）：**客户端入参错误**（guideline_set/limit 非法、
+    # query 非字符串等）归 INVALID_INPUT——此前与数据加载错误混同归 INTERNAL_ERROR，
+    # 编排层无法区分"改入参重试"与"服务端数据坏了"，误导排障。
+    if isinstance(exc, _core.InvalidArgumentError):
+        logger.info("内容服务入参错误（客户端）：%s", exc)
+        return {"ok": False, "error": "INVALID_INPUT", "detail": str(exc)}
     if isinstance(exc, (FileNotFoundError, OSError, json.JSONDecodeError, RuntimeError,
                         KeyError, ValueError)):
         logger.warning("内容服务内部数据错误: %s", exc)
