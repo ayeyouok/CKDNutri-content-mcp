@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional
 from a207_policy import (
     CLINICIAN_ONLY_FIELDS,
     CLINICIAN_ONLY_HIDDEN_FROM,
+    P1_PARENT_HIDDEN_FIELDS,
     enforce_read,
     get_caller,
     knowledge_profile,
@@ -503,7 +504,10 @@ def _section(title: str, body: str) -> str:
 
 # 仅临床角色可见字段（MX-1 字段可见性边界）：单一事实源直接引用 a207_policy.CLINICIAN_ONLY_FIELDS，
 # 不再在包内维护副本（消除 OD-011/OD-013 指出的副本漂移）。
-_CLINICIAN_ONLY: frozenset[str] = CLINICIAN_ONLY_FIELDS
+# D2 修复（2026-08-14）：并集 P1_PARENT_HIDDEN_FIELDS——P1 家长档案视图额外隐藏的
+# 档案级键（medical_record_no / dialysis_detail / bsa_m2 等）也一并剥除。当前编排层
+# 未传 P1 全量档案 dict（不可达），但若未来复用 P1 档案数据进报告，无此并集即透出。
+_CLINICIAN_ONLY: frozenset[str] = CLINICIAN_ONLY_FIELDS | P1_PARENT_HIDDEN_FIELDS
 
 # 非临床角色（家长/患儿）绝不可见 CLINICIAN_ONLY_FIELDS；角色集合单一事实源在
 # a207_policy.CLINICIAN_ONLY_HIDDEN_FROM（C3 禁止包内硬编码）。
