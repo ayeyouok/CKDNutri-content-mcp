@@ -29,7 +29,11 @@ def test_knowledge_search_and_report():
     r = core.search_guideline("CKD")
     # S1（2026-08-12 五包审查）：统一 {ok, data} 信封——断言随契约更新
     assert r.get("ok") is True and "view" in r["data"]
-    assert r["data"].get("count", 0) >= 0
+    # X2（2026-08-14）：此前 `count >= 0` 恒真（count 非负必然成立）——改为有意义的断言：
+    # 检索 "CKD" 必须命中指南（语料库非空），且每条结果携带 source 出处契约键。
+    assert r["data"]["count"] > 0, "检索 'CKD' 应命中指南，语料库可能为空"
+    for item in r["data"]["results"][:3]:
+        assert item.get("source") or item.get("set"), f"指南条目缺 source/set 出处: {item}"
 
     rep = core.generate_patient_report(
         patient_id="P0001",
