@@ -12,7 +12,7 @@ import json
 import os
 import re
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from a207_policy import (
@@ -666,7 +666,9 @@ def generate_patient_report(patient_id: str, demographics: dict, lab_summary: di
         "ok": True,
         "data": {
             "patient_id": patient_id,
-            "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            # C3（2026-08-15）：统一 UTC——此前 datetime.now().astimezone() 本地 aware，
+            # 跨时区部署报告时间戳漂移（与其他包 recorded_at/created_at UTC 口径不一致）
             "overall_status": overall_status,
             "pew_trend": trend,
             "sections": sections,
@@ -675,12 +677,24 @@ def generate_patient_report(patient_id: str, demographics: dict, lab_summary: di
     }
 
 
+def _md_escape(value: Any) -> str:
+    """B2（2026-08-15）：markdown 值转义——化验备注/医生备注等自由文本可含换行或
+    markdown 元字符（#、*、`、[、]、| 等），直接插值可篡改报告结构（注入标题/列表/
+    代码块/表格）。换行折叠为空格（保持单行条目语义），元字符转义为字面量。"""
+    text = str(value if value is not None else "")
+    text = text.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+    return (text.replace("\\", "\\\\").replace("`", "\\`").replace("*", "\\*")
+            .replace("_", "\\_").replace("[", "\\[").replace("]", "\\]")
+            .replace("#", "\\#").replace(">", "\\>").replace("|", "\\|"))
+
+
 def _fmt_dict(d: Any) -> str:
     # BUG-56（2026-08-12）：None 返回 "" 而非 "None"——否则 "None" or "（无）" 会渲染出
     # "二、最新化验：None" 而非预期的 "（无）"。
     # CT-Q1 修复（2026-08-14）：**嵌套 dict/list 递归格式化**——此前 f"- {k}：{v}"
     # 对嵌套结构直接 str(v) → Python repr（{'achievement': {...}}）渲染进家长报告，
     # PII 文本与机器可读 repr 混入 markdown。递归后嵌套键渲染为缩进子列表。
+    # B2（2026-08-15）：标量值经 _md_escape 转义（防自由文本注入 markdown 结构）。
     if d is None:
         return ""
     if isinstance(d, dict):
@@ -690,18 +704,18 @@ def _fmt_dict(d: Any) -> str:
         for k, v in d.items():
             if isinstance(v, dict):
                 inner = _fmt_dict(v)
-                lines.append(f"- {k}：{inner if inner else '（无）'}")
+                lines.append(f"- {_md_escape(k)}：{inner if inner else '（无）'}")
             elif isinstance(v, (list, tuple)):
                 inner = _fmt_list(v)
-                lines.append(f"- {k}：{inner if inner else '（无）'}")
+                lines.append(f"- {_md_escape(k)}：{inner if inner else '（无）'}")
             else:
-                lines.append(f"- {k}：{v}")
+                lines.append(f"- {_md_escape(k)}：{_md_escape(v)}")
         return "\n".join(lines)
-    return str(d)
+    return _md_escape(d)
 
 
 def _fmt_list(items: Any) -> str:
-    """列表递归渲染：元素为 dict → 递归 _fmt_dict；标量 → 顿号拼接。"""
+    """列表递归渲染：元素为 dict → 递归 _fmt_dict；标量 → 顿号拼接（B2 转义）。"""
     if not items:
         return ""
     parts = []
@@ -710,7 +724,7 @@ def _fmt_list(items: Any) -> str:
             inner = _fmt_dict(it)
             parts.append(inner if inner else "（无）")
         else:
-            parts.append(str(it))
+            parts.append(_md_escape(it))
     return "；".join(parts)
 
 

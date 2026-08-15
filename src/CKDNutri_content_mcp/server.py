@@ -37,6 +37,7 @@ def _invalid(exc):
 
 
 def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")  # C2（2026-08-15）：生产 stdout 可采集
     mcp.run()
 
 
