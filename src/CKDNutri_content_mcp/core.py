@@ -413,14 +413,26 @@ def _parse_pew_date(value: Any) -> Optional[datetime]:
     上游 M3 契约=ISO 升序（BUG-60 已统一写入归一化），此处防御性解析——"/"、"." 分隔
     转 "-" 后 fromisoformat；无法解析（如 "Yesterday"、非零填充 "2023-6-1"）返回 None，
     由调用方决定剔除（fail-closed：无法可靠定位时间线的数据点不参与趋势计算）。
+
+    P5（2026-08-15）：**先试原样 fromisoformat**——旧实现直接 .replace(".", "-")
+    会破坏 ISO 微秒时间戳（"2024-01-10T08:30:00.123456" → "…00-123456" 解析失败
+    → 返回 None → 该点被剔除，微秒数据点全部丢失）。仅原样失败才做分隔符替换
+    （兼容 "2024/01/10"、"2024.01.10"）。
     """
     raw = str(value or "").strip()
     if not raw:
         return None
+    dt = None
     try:
-        return datetime.fromisoformat(raw.replace("/", "-").replace(".", "-"))
+        dt = datetime.fromisoformat(raw)
     except ValueError:
-        return None
+        pass
+    if dt is None:
+        try:
+            dt = datetime.fromisoformat(raw.replace("/", "-").replace(".", "-"))
+        except ValueError:
+            return None
+    return dt
 
 
 def _pew_trend_info(pew_history: list[dict]) -> Dict[str, Any]:
@@ -473,9 +485,13 @@ def _derive_status(risk_level: str, pew_history: list[dict],
     # _RISK_TO_STATUS.get 失败会静默回退 stable（fail-open 掩盖真实风险）。
     # BUG-66（2026-08-12）：剥离非字母数字字符——"L 1"/"L-1"/"L1!" 等带分隔符变体
     # 归一化后与 "l1" 一致（旧逻辑 "L 1".strip().lower()="l 1" 查不到 → stable 漏报危急）。
+    # P5（2026-08-15）：**不可哈希类型 TypeError**——risk_level 为 list/dict 时
+    # _RISK_TO_STATUS.get(risk_level)（dict.get 非字符串键）抛 unhashable TypeError
+    # → 报告生成整段崩溃。统一用已归一化字符串 key 查询（str() 转换兜底），
+    # 不再用原始 risk_level 作 dict 键。
     rl = re.sub(r"[^a-z0-9]", "", str(risk_level or "").lower())
     key = rl.upper() if rl in ("l0", "l1", "l2", "l3") else rl
-    base = _RISK_TO_STATUS.get(risk_level) or _RISK_TO_STATUS.get(key, "stable")
+    base = _RISK_TO_STATUS.get(key, "stable")
     # PEW 恶化 → 阶梯提升（BUG-66 后补 ❷，2026-08-12）：
     # stable→caution、caution→critical——此前仅 stable 提升，M8 判 L2(caution) 且 PEW
     # 恶化至危急时报告停留在"需关注"，低估风险。三档状态中 caution 上调一档即 critical
