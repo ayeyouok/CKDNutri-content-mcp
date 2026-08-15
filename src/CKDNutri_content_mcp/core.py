@@ -505,10 +505,24 @@ def _derive_status(risk_level: str, pew_history: list[dict],
     # 营养摄入达成率过低（<50%）→ 至少 caution
     # BUG-62：显式 None/dict 处理——{"intake": None} 时旧链式 .get 抛 AttributeError
     # 被宽 except 吞掉（行为虽对），改显式后不再掩盖其它异常
+    # F-2（2026-08-15）：**键名兼容**——P2 assess_intake_vs_target 实际输出
+    # `data.energy.achievement_pct`，旧链读 `intake.achievement.energy_pct` 永远取不到
+    # → 摄入 <50% 的能量严重不足患儿报告整体仍 "stable"（静默漏报，已实测）。兼容
+    # 三种结构：① P2 实际 data.energy.achievement_pct；② 直接 energy.achievement_pct；
+    # ③ 旧契约 intake.achievement.energy_pct。
+    energy_pct: Any = 100
     if isinstance(nutrition_assessment, dict):
-        intake = nutrition_assessment.get("intake")
-        ach = (intake.get("achievement") or {}) if isinstance(intake, dict) else {}
-        energy_pct = ach.get("energy_pct", 100)
+        _d = nutrition_assessment.get("data")
+        if isinstance(_d, dict) and isinstance(_d.get("energy"), dict) \
+                and isinstance(_d["energy"].get("achievement_pct"), (int, float)):
+            energy_pct = _d["energy"]["achievement_pct"]
+        elif isinstance(nutrition_assessment.get("energy"), dict) \
+                and isinstance(nutrition_assessment["energy"].get("achievement_pct"), (int, float)):
+            energy_pct = nutrition_assessment["energy"]["achievement_pct"]
+        else:
+            intake = nutrition_assessment.get("intake")
+            ach = (intake.get("achievement") or {}) if isinstance(intake, dict) else {}
+            energy_pct = ach.get("energy_pct", 100)
         if isinstance(energy_pct, (int, float)) and energy_pct < 50 and base == "stable":
             base = "caution"
     return base
