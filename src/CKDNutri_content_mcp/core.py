@@ -451,15 +451,28 @@ def _pew_trend_info(pew_history: list[dict]) -> Dict[str, Any]:
         # BUG-66 后补（2026-08-12）：level 未知值同样剔除——_PEW_ORDER.get(level, 0)
         # 会把 "unknown"/拼写错误静默映射为 0(low)，high→unknown 被误判"改善"掩盖恶化；
         # 与日期无效同理，无法可靠判定严重度的点不参与趋势（fail-closed）。
-        if str(p.get("level", "low")).strip().lower() not in _PEW_ORDER:
+        # M（2026-08-16，第七轮审查）：**缺 level 键也剔除**——此前 p.get("level",
+        # "low") 对缺失键默认 low，数据不完整的点被当"轻"参与趋势（与 fail-closed
+        # 意图相悖）；显式 None 判定。
+        lv = p.get("level")
+        if lv is None or str(lv).strip().lower() not in _PEW_ORDER:
             continue
         dated.append((dt, p))
     if len(dated) < 2:
         return {"trend": "no_data", "valid_count": len(dated), "total_count": len(pts)}
     dated.sort(key=lambda x: x[0])
-    fo = _PEW_ORDER[str(dated[0][1].get("level", "low")).strip().lower()]
-    lo = _PEW_ORDER[str(dated[-1][1].get("level", "low")).strip().lower()]
-    trend = "worsening" if lo > fo else "improving" if lo < fo else "stable"
+    fo = _PEW_ORDER[str(dated[0][1].get("level")).strip().lower()]
+    # M（2026-08-16，第七轮审查）：趋势 = 首点 vs **全程最高严重度**——此前只比
+    # 首尾两点，low→critical→low 被压成 stable（中间出现过危急但首尾回落，低估风险）。
+    # 出现过比首点更严重的 → worsening（即使尾点回落）；否则按首尾比较。
+    peak = max(_PEW_ORDER[str(p[1].get("level")).strip().lower()] for p in dated)
+    lo = _PEW_ORDER[str(dated[-1][1].get("level")).strip().lower()]
+    if peak > fo:
+        trend = "worsening"
+    elif lo < fo:
+        trend = "improving"
+    else:
+        trend = "stable"
     return {"trend": trend, "valid_count": len(dated), "total_count": len(pts)}
 
 
@@ -637,10 +650,12 @@ def generate_patient_report(patient_id: str, demographics: dict, lab_summary: di
         f"- 年龄：{demographics.get('age_years')} 岁　性别：{d_sex}\n"
         f"- CKD 分期：{demographics.get('ckd_stage')}　透析方式：{demographics.get('dialysis_mode')}"))
     lines.append(_section("二、最新化验（M2/LIS）",
-                          _fmt_dict(_mask_clinician_fields(lab_summary)) or "（无）"))
+                          _fmt_dict(_mask_clinician_fields(lab_summary) if mask else lab_summary)
+                          or "（无）"))
     lines.append(_section("三、营养评估（M3）",
-                          _fmt_dict(_mask_clinician_fields(nutrition_assessment)) or "（无）"))
-    _fu = _mask_clinician_fields(followup_summary) or {}
+                          _fmt_dict(_mask_clinician_fields(nutrition_assessment) if mask
+                                    else nutrition_assessment) or "（无）"))
+    _fu = (_mask_clinician_fields(followup_summary) if mask else followup_summary) or {}
     # BUG-63（2026-08-12）：类型安全提取——records/adherence 非列表时原 [-1] 索引会
     # TypeError；plans 为数值（如 3 表示 3 项计划）时原 len() 也崩，数值按计数处理。
     records = _fu.get("records")

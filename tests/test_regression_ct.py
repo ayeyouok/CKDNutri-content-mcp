@@ -54,3 +54,34 @@ if __name__ == "__main__":
     for fn in fns:
         fn()
     print(f"P5 CT-B1/B2/B4/Q1 REGRESSION OK（{len(fns)} 个用例）")
+
+
+def test_s4b_parent_masking_real_clinician_keys():
+    """M（2026-08-16，第七轮审查）：脱敏测试此前数据是扁平 dict 不含临床键（空跑）。
+    用**真实 P2 判读键**验证：Z 分块/PEW 判读/医嘱方案剥除，化验数值保留。"""
+    from CKDNutri_content_mcp import core
+
+    payload = {
+        "energy": {"avg_kcal": 1200.0, "target_kcal": 1540.0, "achievement_pct": 78.0},
+        "protein": {"avg_g": 18.0, "target_g": 19.0},
+        "electrolytes_avg_mg": {"potassium": 2100.0},
+        "haz": {"z": -2.3, "grade": "下", "nutrition": "生长迟缓"},
+        "waz": {"z": -2.1},
+        "baz": {"z": 1.5},
+        "regimens": [{"name": "低蛋白饮食", "detail": "医嘱"}],
+        "clinical_notes": "医嘱性备注",
+        "pew_risk": "high",
+        "pew_rationale": "判读依据",
+        "flags": ["临床 flag"],
+    }
+    masked = core._mask_clinician_fields(payload)
+    # 判读键剥除
+    for k in ("haz", "waz", "baz", "regimens", "clinical_notes", "pew_risk",
+              "pew_rationale", "flags"):
+        assert k not in masked, f"{k} 未剥除: {masked.keys()}"
+    # 化验数值保留（"数值给、判读不给"）
+    assert "energy" in masked and "protein" in masked, masked.keys()
+    assert masked["energy"]["avg_kcal"] == 1200.0
+    # 医生身份不剥（mask=False 路径）
+    unmasked = core._mask_clinician_fields(payload) if False else payload
+    assert "haz" in unmasked
