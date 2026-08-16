@@ -46,7 +46,9 @@ def test_ct_q1_fmt_dict_no_python_repr():
                           "risk": "L2"})
     assert "{'achievement'" not in out, "repr 泄漏"
     assert "{'energy_pct'" not in out
-    assert "- energy_pct：82.0" in out, out
+    # 八审（2026-08-16）：_md_escape 把 _ → \_ 是 B2 防注入行为（2026-08-15 有意为之），
+    # 断言必须跟随后端实际转义输出——此前断言陈旧（未转义的 energy_pct 永不可能出现）。
+    assert "- energy\\_pct：82.0" in out, out
 
 
 if __name__ == "__main__":

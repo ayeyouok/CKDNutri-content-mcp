@@ -15,8 +15,16 @@ from pathlib import Path
 os.environ.setdefault("A207_CALLER", "doctor_assistant")
 
 SRC = Path(__file__).resolve().parents[1] / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
+# 八审（2026-08-16）：与 test_regression_ct.py 同口径，显式把 a207-policy/src 置顶。
+# 此前只加本包 src——若测试机 sys.path 残留旧版 a207_policy 副本（如
+# D:\MyUserData\...\a207-policy\src，仅 15 个临床字段、缺 haz/waz/baz/regimens/
+# pew_risk），pytest 收集本文件先导入时会把它缓存进 core._CLINICIAN_ONLY
+# （模块级常量，之后不可变）→ test_s4b 用真实判读键断言必失败。insert(0) 确保
+# 仓库内新版 a207-policy 优先于任何已安装/残留副本。
+_POLICY_SRC = Path(__file__).resolve().parents[1].parents[1] / "a207-policy" / "src"
+for _p in (SRC, _POLICY_SRC):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 
 def test_server_imports():
