@@ -588,7 +588,7 @@ def generate_patient_report(patient_id: str, demographics: dict, lab_summary: di
     try:
         patient_id = validate_patient_id(patient_id)
     except ValueError as exc:
-        return {"ok": False, "error": "INVALID_ARGUMENT", "detail": str(exc)}
+        return {"ok": False, "error": "INVALID_INPUT", "detail": str(exc)}
     # BUG-62 后补（2026-08-12）：顶层防空——编排层直调可能传 None（fastmcp 工具层对
     # 必填 dict 形参可能放行显式 null），demographics=None 会在下方 .get() 抛
     # AttributeError。统一 `or {}` 兜底，None/空按无数据处理。
