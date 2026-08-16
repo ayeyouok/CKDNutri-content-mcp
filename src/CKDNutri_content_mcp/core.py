@@ -631,7 +631,9 @@ def generate_patient_report(patient_id: str, demographics: dict, lab_summary: di
             "count": pew_info["valid_count"],
             "total_records": pew_info["total_count"],
             "trend": trend,
-            "source": "M3 (ADR-007)",
+            # M-2（2026-08-16，十一审）：架构语言不进家长上下文——此前 source 硬编码
+            # "M3 (ADR-007)"（内部模块编号），家长报告暴露架构语言。改中性描述。
+            "source": "PEW 历史（营养评估）",
             "note": (f"趋势基于 {pew_info['valid_count']}/{pew_info['total_count']} 条有效记录"
                      if pew_info["valid_count"] < pew_info["total_count"] else "全部记录有效"),
         },
@@ -649,10 +651,10 @@ def generate_patient_report(patient_id: str, demographics: dict, lab_summary: di
         "一、基本信息",
         f"- 年龄：{demographics.get('age_years')} 岁　性别：{d_sex}\n"
         f"- CKD 分期：{demographics.get('ckd_stage')}　透析方式：{demographics.get('dialysis_mode')}"))
-    lines.append(_section("二、最新化验（M2/LIS）",
+    lines.append(_section("二、最新化验",
                           _fmt_dict(_mask_clinician_fields(lab_summary) if mask else lab_summary)
                           or "（无）"))
-    lines.append(_section("三、营养评估（M3）",
+    lines.append(_section("三、营养评估",
                           _fmt_dict(_mask_clinician_fields(nutrition_assessment) if mask
                                     else nutrition_assessment) or "（无）"))
     _fu = (_mask_clinician_fields(followup_summary) if mask else followup_summary) or {}
@@ -670,7 +672,7 @@ def generate_patient_report(patient_id: str, demographics: dict, lab_summary: di
     else:
         plans_count = 0
     lines.append(_section(
-        "四、随访与依从（M4）",
+        "四、随访与依从",
         f"- 最近随访：{_fmt_block(records[-1] if records else {})}\n"
         f"- 依从性：{_fmt_block(adherence[-1] if adherence else {})}\n"
         f"- 进行中计划数：{plans_count}"))
@@ -678,15 +680,15 @@ def generate_patient_report(patient_id: str, demographics: dict, lab_summary: di
     # "N 条无效"，数据质量越差（有效点越少）显示的"无效"反而越少，严重误导可信度判断。
     invalid_count = pew_info["total_count"] - pew_info["valid_count"]
     lines.append(_section(
-        "五、PEW 历史（M3，ADR-007）",
+        "五、PEW 历史",
         f"- 历史点数：{pew_info['valid_count']}/{pew_info['total_count']}（有效/总数）　趋势：{trend}"
         + (f"\n- 提示：{invalid_count} 条记录日期格式无效，未参与趋势计算"
            if pew_info["valid_count"] < pew_info["total_count"] else "")))
     # 六审：未知风险等级在 markdown 中显式提示（不静默展示为"稳定"）
     risk_line = f"- 等级：{risk_level}"
     if risk_unknown:
-        risk_line += "（⚠ 无法解析的风险等级，整体状态按保守口径展示，请核对上游 M8 输出）"
-    lines.append(_section("六、风险等级（M8）", risk_line))
+        risk_line += "（⚠ 无法解析的风险等级，整体状态按保守口径展示，请核对上游评估输出）"
+    lines.append(_section("六、风险等级", risk_line))
     lines.append(_section("七、综合结论", f"**整体状态：{_STATUS_CN.get(overall_status, overall_status)}**"))
 
     # S1（2026-08-12 五包审查）：统一 {ok, data} 信封——此前 {ok, patient_id, ...} 平铺
