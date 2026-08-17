@@ -389,7 +389,12 @@ def _self_test_refs() -> List[str]:
 
 _RISK_TO_STATUS = {
     "L1": "critical", "high": "critical", "critical": "critical",
-    "L2": "caution", "L3": "caution", "medium": "caution", "caution": "caution",
+    "L2": "caution", "medium": "caution", "caution": "caution",
+    # F6（2026-08-17，十二审）：L3 是**最低风险档**（rules.json:9 "L3=低风险：
+    # 常规随访关注"，_LEVEL_RANK={"L3":1}）——此前映射 caution 与 L2（中风险）
+    # 同标"需关注"，低风险患儿与高危同色、告警信号被稀释（过报）。改 stable
+    # （常规随访=稳定），语义对齐 rules.json 与 _PEW_ORDER（l3 排名 1 < l2 2）。
+    "L3": "stable",
     "L0": "stable", "low": "stable", "none": "stable", "stable": "stable",
 }
 # 💭（2026-08-12 五包审查）：状态中文映射前移至常量区（此前定义在使用点之后，
@@ -611,6 +616,22 @@ def generate_patient_report(patient_id: str, demographics: dict, lab_summary: di
     rl_norm = re.sub(r"[^a-z0-9]", "", str(risk_level or "").lower())
     risk_unknown = rl_norm not in ("l0", "l1", "l2", "l3", "low", "medium", "high",
                                    "critical", "caution", "stable", "none")
+    # F7（2026-08-17，十二审）：**营养评估未评估透明化**——空 nutrition dict 时
+    # _derive_status 的 energy_pct 默认 100 永不升级（fail-open），且报告无任何提示
+    # （与 risk.valid 不对称）。现标注 nutrition_valid=false：nutrition_assessment 为
+    # 空/无 data.energy.achievement_pct 时表示摄入数据缺失，报告显式提示"未评估"，
+    # 不把"没数据"当"达成 100%"。
+    _na = nutrition_assessment if isinstance(nutrition_assessment, dict) else {}
+    _na_data = _na.get("data") if isinstance(_na.get("data"), dict) else {}
+    nutrition_valid = (
+        isinstance(_na_data.get("energy"), dict)
+        and isinstance(_na_data["energy"].get("achievement_pct"), (int, float))) \
+        or (
+            isinstance(_na.get("energy"), dict)
+            and isinstance(_na["energy"].get("achievement_pct"), (int, float))) \
+        or (isinstance(_na.get("intake"), dict)
+            and isinstance((_na["intake"].get("achievement") or {}).get("energy_pct"),
+                           (int, float)))
     # MX-1：家长/患儿（非临床角色）拿受限视图 —— sections 与 summary_markdown 一致脱敏，
     # 避免经结构化章节泄露原始化验值（红队 C8：原仅脱敏 summary，sections 仍透出 raw scr/k）。
     mask = caller in _NON_CLINICAL_MASKED
@@ -641,6 +662,9 @@ def generate_patient_report(patient_id: str, demographics: dict, lab_summary: di
                  # 六审（2026-08-13）：未知等级显式标注——_derive_status 对非法
                  # risk_level 静默归 stable（fail-open 掩盖真实风险），报告必须透明。
                  "valid": not risk_unknown},
+        # F7（2026-08-17）：营养摄入达成率未评估透明化——空 dict/无摄入数据时
+        # nutrition_valid=false，报告显式提示（不把"没数据"当"达成 100%"）。
+        "nutrition_valid": nutrition_valid,
         "overall_status": overall_status,
     }
 
@@ -657,6 +681,12 @@ def generate_patient_report(patient_id: str, demographics: dict, lab_summary: di
     lines.append(_section("三、营养评估",
                           _fmt_dict(_mask_clinician_fields(nutrition_assessment) if mask
                                     else nutrition_assessment) or "（无）"))
+    # F7（2026-08-17）：营养未评估显式提示——空 nutrition dict 时"（无）"不区分
+    # "未评估"与"评估无数据"，家长无法判断是否漏评。补一行提示（与 risk.valid=false
+    # 的透明口径对称）。
+    if not nutrition_valid:
+        lines.append("> ⚠ 营养摄入数据未提供（或未评估），摄入达成率不参与整体状态判定；"
+                     "请补充 3 日饮食日记后复评。")
     _fu = (_mask_clinician_fields(followup_summary) if mask else followup_summary) or {}
     # BUG-63（2026-08-12）：类型安全提取——records/adherence 非列表时原 [-1] 索引会
     # TypeError；plans 为数值（如 3 表示 3 项计划）时原 len() 也崩，数值按计数处理。

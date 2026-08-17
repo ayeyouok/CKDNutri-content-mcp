@@ -84,6 +84,8 @@ def test_s4b_parent_masking_real_clinician_keys():
     # 化验数值保留（"数值给、判读不给"）
     assert "energy" in masked and "protein" in masked, masked.keys()
     assert masked["energy"]["avg_kcal"] == 1200.0
-    # 医生身份不剥（mask=False 路径）
-    unmasked = core._mask_clinician_fields(payload) if False else payload
+    # 医生身份不剥（mask=False 路径）——十二审：`if False else payload` 是死代码
+    # （恒取 payload，右侧分支永不执行）。真实语义：原始 payload 含判读字段
+    # （剥除逻辑由 _mask_clinician_fields 按清单处理），此处验证 payload 结构完整。
+    unmasked = payload
     assert "haz" in unmasked
