@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import threading
@@ -249,7 +250,10 @@ def search_guideline(query: str, guideline_set: Optional[str] = None,
     # "无匹配"与"没给关键词"。
     if not (query or "").strip():
         return {"ok": True, "data": {
-            "query": query, "role": caller, "view": view, "count": 0, "results": [],
+            "query": query, "role": caller, "view": view, "count": 0,
+            # P2-1（2026-08-18）：空分支补 returned_count（与正常分支 Schema 一致，
+            # 编排层无需区分空/非空两种形状）
+            "returned_count": 0, "results": [],
             # CT-B1（2026-08-14）：空分支补 truncated（与正常分支信封键一致，
             # 编排层无需区分空/非空两种形状）
             "truncated": False,
@@ -323,7 +327,9 @@ def search_sop(query: str, limit: int = 20) -> Dict[str, Any]:
     # 四审（2026-08-12）：空关键词显式提示（与 search_guideline 同口径）
     if not (query or "").strip():
         return {"ok": True, "data": {
-            "query": query, "count": 0, "results": [],
+            "query": query, "count": 0,
+            # P2-1（2026-08-18）：空分支补 returned_count（与正常分支 Schema 一致）
+            "returned_count": 0, "results": [],
             # CT-B1（2026-08-14）：补 view（与 search_guideline 信封一致，编排层统一
             # 取 data.view；此前 SOP 的 view 只出现在结果条目层，形状分裂）
             "view": view, "truncated": False,
@@ -435,6 +441,17 @@ _PEW_ORDER = {
 }
 
 
+def _is_number(value: Any) -> bool:
+    """P2-2（2026-08-18）：有限数值判定——bool 是 int 子类（isinstance(True,
+    (int,float)) 为 True）、NaN/Inf 属于 float 但比较语义异常（NaN < 50 恒 False），
+    二者此前都能通过 isinstance 检查被当有效数值（False→0% 触发误报预警、NaN
+    静默不触发）。统一排除 bool 与非有限值。
+    """
+    return (isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value))
+
+
 def _parse_pew_date(value: Any) -> Optional[datetime]:
     """解析 PEW 历史日期为 datetime；无效/缺失返回 None。
 
@@ -460,6 +477,15 @@ def _parse_pew_date(value: Any) -> Optional[datetime]:
             dt = datetime.fromisoformat(raw.replace("/", "-").replace(".", "-"))
         except ValueError:
             return None
+    # P1-1（2026-08-18）：统一转 **UTC aware**——fromisoformat 对无时区串
+    # （如 "2026-08-18"）生成 naive、带时区串（如 "2026-08-18T10:00:00+08:00"）
+    # 生成 aware，两者混排 `dated.sort` 直接抛 TypeError: can't compare
+    # offset-naive and offset-aware datetimes（报告生成全盘失败）。统一：
+    # naive → replace(tzinfo=utc)、aware → astimezone(utc)，保证可比且跨时区同刻同值。
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
     return dt
 
 
@@ -470,6 +496,12 @@ def _pew_trend_info(pew_history: list[dict]) -> Dict[str, Any]:
     total_count 供报告层明示"趋势基于多少有效点"——避免 10 条记录仅 2 条有效时
     报告显示"历史点数：10 趋势：stable"掩盖数据质量问题。
     """
+    # P1-2（2026-08-18）：total_count 用**真实分母** len(pew_history or [])（含
+    # 非 dict 非法记录）——此前 `pts = [p ... if isinstance(p, dict)]` 后
+    # total_count=len(pts)，输入 4 条（2 有效 + 2 非法）显示 valid 2/total 2
+    # （"100% 有效"），静默掩盖脏数据。非 dict 记录不参与趋势但必须计入总数，
+    # 供报告层透明提示"X 条非法记录未参与计算"。
+    total_count = len(pew_history or [])
     pts = [p for p in (pew_history or []) if isinstance(p, dict)]
     dated = []
     for p in pts:
@@ -487,7 +519,7 @@ def _pew_trend_info(pew_history: list[dict]) -> Dict[str, Any]:
             continue
         dated.append((dt, p))
     if len(dated) < 2:
-        return {"trend": "no_data", "valid_count": len(dated), "total_count": len(pts),
+        return {"trend": "no_data", "valid_count": len(dated), "total_count": total_count,
                 "current_level": None, "historical_peak": None}
     dated.sort(key=lambda x: x[0])
     fo = _PEW_ORDER[str(dated[0][1].get("level")).strip().lower()]
@@ -507,7 +539,7 @@ def _pew_trend_info(pew_history: list[dict]) -> Dict[str, Any]:
     else:
         trend = "stable"
     _peak_entry = max(dated, key=lambda x: _PEW_ORDER[str(x[1].get("level")).strip().lower()])
-    return {"trend": trend, "valid_count": len(dated), "total_count": len(pts),
+    return {"trend": trend, "valid_count": len(dated), "total_count": total_count,
             "current_level": dated[-1][1].get("level"),
             "historical_peak": _peak_entry[1].get("level")}
 
@@ -566,17 +598,19 @@ def _derive_status(risk_level: str, pew_history: list[dict],
     energy_pct: Any = 100
     if isinstance(nutrition_assessment, dict):
         _d = nutrition_assessment.get("data")
+        # P2-2（2026-08-18）：isinstance((int,float)) 会放过 bool（True 当 1）与
+        # NaN/Inf（NaN<50 恒 False 静默不触发）——统一 _is_number 排除。
         if isinstance(_d, dict) and isinstance(_d.get("energy"), dict) \
-                and isinstance(_d["energy"].get("achievement_pct"), (int, float)):
+                and _is_number(_d["energy"].get("achievement_pct")):
             energy_pct = _d["energy"]["achievement_pct"]
         elif isinstance(nutrition_assessment.get("energy"), dict) \
-                and isinstance(nutrition_assessment["energy"].get("achievement_pct"), (int, float)):
+                and _is_number(nutrition_assessment["energy"].get("achievement_pct")):
             energy_pct = nutrition_assessment["energy"]["achievement_pct"]
         else:
             intake = nutrition_assessment.get("intake")
             ach = (intake.get("achievement") or {}) if isinstance(intake, dict) else {}
             energy_pct = ach.get("energy_pct", 100)
-        if isinstance(energy_pct, (int, float)) and energy_pct < 50 and base == "stable":
+        if _is_number(energy_pct) and energy_pct < 50 and base == "stable":
             base = "caution"
     return base
 
@@ -686,13 +720,12 @@ def generate_patient_report(patient_id: str, demographics: dict, lab_summary: di
     _na_data = _na.get("data") if isinstance(_na.get("data"), dict) else {}
     nutrition_valid = (
         isinstance(_na_data.get("energy"), dict)
-        and isinstance(_na_data["energy"].get("achievement_pct"), (int, float))) \
+        and _is_number(_na_data["energy"].get("achievement_pct"))) \
         or (
             isinstance(_na.get("energy"), dict)
-            and isinstance(_na["energy"].get("achievement_pct"), (int, float))) \
+            and _is_number(_na["energy"].get("achievement_pct"))) \
         or (isinstance(_na.get("intake"), dict)
-            and isinstance((_na["intake"].get("achievement") or {}).get("energy_pct"),
-                           (int, float)))
+            and _is_number((_na["intake"].get("achievement") or {}).get("energy_pct")))
     # MX-1：家长/患儿（非临床角色）拿受限视图 —— sections 与 summary_markdown 一致脱敏，
     # 避免经结构化章节泄露原始化验值（红队 C8：原仅脱敏 summary，sections 仍透出 raw scr/k）。
     mask = caller in _NON_CLINICAL_MASKED

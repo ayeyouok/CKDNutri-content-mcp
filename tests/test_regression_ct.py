@@ -186,3 +186,64 @@ def test_p14_search_count_vs_returned_count():
     assert "returned_count" in d, d.keys()
     assert d["returned_count"] == min(d["count"], 2), d
     assert d["returned_count"] == len(d["results"]), d
+
+
+def test_p11_pew_mixed_tz_sort_ok():
+    """P1-1（2026-08-18）：PEW 日期混合时区（naive/aware）不再排序崩溃——
+    _parse_pew_date 统一返回 UTC aware；naive '2026-08-18' 与
+    '2026-08-18T10:00:00+08:00'（=UTC 02:00）混排可正常排序且同刻比较一致。"""
+    from CKDNutri_content_mcp import core
+
+    hist = [
+        {"date": "2026-08-18T10:00:00+08:00", "level": "low"},
+        {"date": "2026-08-18", "level": "medium"},  # naive
+        {"date": "2026-08-19T00:00:00Z", "level": "high"},
+    ]
+    info = core._pew_trend_info(hist)  # 修复前 dated.sort 抛 TypeError
+    assert info["trend"] == "worsening", info  # high > low（首尾），且未崩溃
+    assert info["valid_count"] == 3, info
+
+
+def test_p12_pew_total_count_real_denominator():
+    """P1-2（2026-08-18）：total_count 用真实分母（含非 dict 非法记录）——
+    输入 4 条（2 有效 + 2 非法）必须显示 valid 2 / total 4，不静默掩盖脏数据。"""
+    from CKDNutri_content_mcp import core
+
+    hist = [
+        {"date": "2026-08-01", "level": "low"},
+        {"date": "2026-08-02", "level": "low"},
+        None,                      # 非 dict 非法记录
+        {"date": "not-a-date"},    # 日期无效
+    ]
+    info = core._pew_trend_info(hist)
+    assert info["valid_count"] == 2, info
+    assert info["total_count"] == 4, info  # 修复前为 2（过滤后分母）
+
+
+def test_p21_empty_query_returned_count():
+    """P2-1（2026-08-18）：search_guideline/search_sop 空查询分支补齐
+    returned_count（与正常分支 Schema 一致）。"""
+    from CKDNutri_content_mcp import core
+
+    for d in (core.search_guideline("")["data"], core.search_sop("")["data"]):
+        assert d["count"] == 0 and d["returned_count"] == 0, d
+
+
+def test_p22_bool_nan_not_valid_number():
+    """P2-2（2026-08-18）：bool/NaN 不再被当有效数值——achievement_pct=False
+    不得触发 <50% 的 caution 预警；NaN 不得静默通过。"""
+    from CKDNutri_content_mcp import core
+
+    # bool：False 不应触发 caution（修复前 isinstance(False,(int,float)) 通过且
+    # False < 50 → base 被抬到 caution）
+    assert core._derive_status("L0", [], {"data": {"energy": {"achievement_pct": False}}}) == "stable"
+    # NaN：非有限值不参与判定（修复前 isinstance 通过但 NaN<50 恒 False 静默）
+    r = core._derive_status("L0", [], {"data": {"energy": {"achievement_pct": float("nan")}}})
+    assert r == "stable", r
+    # 真实 <50% 仍触发 caution
+    assert core._derive_status("L0", [], {"data": {"energy": {"achievement_pct": 30}}}) == "caution"
+    # nutrition_valid 对 bool/NaN 判无效
+    g = core.generate_patient_report("P0001", {}, {}, {"data": {"energy": {"achievement_pct": False}}},
+                                     {}, [], "L1")
+    assert g["ok"] is True
+    assert g["data"]["sections"]["nutrition_valid"] is False, g["data"]["sections"]
