@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import html
 import json
 import math
 import os
@@ -47,6 +48,9 @@ _GUIDES: Optional[Dict[str, Any]] = None
 _SOPS: Optional[Dict[str, Any]] = None
 # BUG-66 后补（2026-08-12）：跨文件 id 唯一性校验结果缓存（get_citation 入口一次性校验）
 _CROSS_IDS_CHECKED = False
+# P1-3（2026-08-18）：校验标志的并发锁——高并发启动时多线程同时触发重复加载/校验
+# （_CROSS_IDS_CHECKED 无锁读写非原子），double-checked locking 保证只做一次。
+_CROSS_IDS_LOCK = threading.Lock()
 # S3（2026-08-12 五包审查）：懒加载并发锁（double-checked locking，对齐 assessment
 # _RULES_LOCK）——FastMCP/多 worker 线程并发首次调用时防重复 I/O 与重复 JSON 解析。
 _GUIDES_LOCK = threading.Lock()
@@ -65,14 +69,18 @@ def _validate_cross_file_ids() -> None:
     global _CROSS_IDS_CHECKED
     if _CROSS_IDS_CHECKED:
         return
-    guides = _load_guides()
-    sops = _load_sops()
-    overlaps = {e["id"] for e in guides["entries"]} & {s["id"] for s in sops["sops"]}
-    if overlaps:
-        raise ValueError(
-            f"指南与 SOP 条目 id 冲突：{sorted(overlaps)}，拒绝加载"
-            f"（get_citation 按指南优先解析，需跨文件 id 唯一）")
-    _CROSS_IDS_CHECKED = True
+    with _CROSS_IDS_LOCK:
+        # P1-3（2026-08-18）：双重检查——首个线程进入锁后重判，避免排队线程重复校验。
+        if _CROSS_IDS_CHECKED:
+            return
+        guides = _load_guides()
+        sops = _load_sops()
+        overlaps = {e["id"] for e in guides["entries"]} & {s["id"] for s in sops["sops"]}
+        if overlaps:
+            raise ValueError(
+                f"指南与 SOP 条目 id 冲突：{sorted(overlaps)}，拒绝加载"
+                f"（get_citation 按指南优先解析，需跨文件 id 唯一）")
+        _CROSS_IDS_CHECKED = True
 
 
 def _load_guides() -> Dict[str, Any]:
@@ -241,6 +249,7 @@ def search_guideline(query: str, guideline_set: Optional[str] = None,
     if not isinstance(query, str):
         raise InvalidArgumentError(f"query 必须为字符串，收到 {type(query).__name__}")
     # P1-1（2026-08-18）：limit 统一走 _validate_limit（单一实现，不再双校验双异常）
+    raw_limit = limit  # P2-1（2026-08-18）：保留调用方原始请求值（语义透明字段）
     limit = _validate_limit(limit)
     # 四审（2026-08-12）：guideline_set 校验（大小写容错 + 枚举报错）
     guideline_set = _validate_guideline_set(guideline_set)
@@ -298,7 +307,10 @@ def search_guideline(query: str, guideline_set: Optional[str] = None,
         # P1-4（2026-08-18）：count=**命中总数**、returned_count=实际截取返回数——
         # 此前仅 count 一处，调用方易误解为"实际返回条数"（limit 截断时 count 是
         # 全量命中数）。新增 returned_count 明确语义，count 保留兼容既有消费者。
+        # P2-1（2026-08-18）：requested_limit=调用方请求值、effective_limit=钳制后
+        # 实际生效值——此前静默截断到 100 不告知，上层可能误判知识库全量大小。
         "count": len(out), "returned_count": min(len(out), limit),
+        "requested_limit": raw_limit, "effective_limit": limit,
         "results": out[:limit],
         "truncated": truncated,
         "note": f"命中 {len(out)} 条，已截断返回前 {limit} 条（limit={limit}）" if truncated else None,
@@ -321,6 +333,7 @@ def search_sop(query: str, limit: int = 20) -> Dict[str, Any]:
     if not isinstance(query, str):
         raise InvalidArgumentError(f"query 必须为字符串，收到 {type(query).__name__}")
     # P1-1（2026-08-18）：limit 统一走 _validate_limit（单一实现，不再双校验双异常）
+    raw_limit = limit  # P2-1（2026-08-18）：保留调用方原始请求值（语义透明字段）
     limit = _validate_limit(limit)
     view = _view_for_caller(caller)
     sops = _load_sops()
@@ -364,7 +377,9 @@ def search_sop(query: str, limit: int = 20) -> Dict[str, Any]:
     truncated = len(out) > limit
     return {"ok": True, "data": {"query": query,
                                  # P1-4（2026-08-18）：count=命中总数、returned_count=实际返回数
+                                 # P2-1（2026-08-18）：requested/effective_limit 语义透明
                                  "count": len(out), "returned_count": min(len(out), limit),
+                                 "requested_limit": raw_limit, "effective_limit": limit,
                                  "results": out[:limit],
                                  "truncated": truncated,
                                  "note": (f"命中 {len(out)} 条，已截断返回前 {limit} 条"
@@ -386,6 +401,9 @@ def get_citation(ref_id: str) -> Dict[str, Any]:
     if not isinstance(ref_id, str) or not ref_id.strip():
         raise InvalidArgumentError(
             f"ref_id 必须为非空字符串，收到：{ref_id!r}")
+    # P1-2（2026-08-18）：strip 归一化——此前仅校验时 strip、匹配 `e["id"] == ref_id`
+    # 用原始串，带首尾空格的合法 ID（" KDIGO2024-001 "）匹配失败返回 NOT_FOUND。
+    ref_id = ref_id.strip()
     _validate_cross_file_ids()
     guides = _load_guides()
     for e in guides["entries"]:
@@ -503,10 +521,14 @@ def _pew_trend_info(pew_history: list[dict]) -> Dict[str, Any]:
     # 供报告层透明提示"X 条非法记录未参与计算"。
     total_count = len(pew_history or [])
     pts = [p for p in (pew_history or []) if isinstance(p, dict)]
+    invalid_type_count = total_count - len(pts)
     dated = []
+    invalid_date_count = 0
+    invalid_level_count = 0
     for p in pts:
         dt = _parse_pew_date(p.get("date"))
         if dt is None:
+            invalid_date_count += 1
             continue
         # BUG-66 后补（2026-08-12）：level 未知值同样剔除——_PEW_ORDER.get(level, 0)
         # 会把 "unknown"/拼写错误静默映射为 0(low)，high→unknown 被误判"改善"掩盖恶化；
@@ -516,10 +538,16 @@ def _pew_trend_info(pew_history: list[dict]) -> Dict[str, Any]:
         # 意图相悖）；显式 None 判定。
         lv = p.get("level")
         if lv is None or str(lv).strip().lower() not in _PEW_ORDER:
+            invalid_level_count += 1
             continue
         dated.append((dt, p))
     if len(dated) < 2:
         return {"trend": "no_data", "valid_count": len(dated), "total_count": total_count,
+                # P1-1（2026-08-18）：按原因分类统计——统一"日期格式无效"会误导
+                # （风险等级非法/缺 level/非 dict 都被归为日期错误，医疗语义失真）。
+                "invalid_date_count": invalid_date_count,
+                "invalid_level_count": invalid_level_count,
+                "invalid_type_count": invalid_type_count,
                 "current_level": None, "historical_peak": None}
     dated.sort(key=lambda x: x[0])
     fo = _PEW_ORDER[str(dated[0][1].get("level")).strip().lower()]
@@ -540,6 +568,10 @@ def _pew_trend_info(pew_history: list[dict]) -> Dict[str, Any]:
         trend = "stable"
     _peak_entry = max(dated, key=lambda x: _PEW_ORDER[str(x[1].get("level")).strip().lower()])
     return {"trend": trend, "valid_count": len(dated), "total_count": total_count,
+            # P1-1（2026-08-18）：按原因分类统计（见 no_data 分支注释）。
+            "invalid_date_count": invalid_date_count,
+            "invalid_level_count": invalid_level_count,
+            "invalid_type_count": invalid_type_count,
             "current_level": dated[-1][1].get("level"),
             "historical_peak": _peak_entry[1].get("level")}
 
@@ -653,6 +685,49 @@ def _ensure_dict(value: Any, name: str) -> dict:
     return value
 
 
+def _validate_demographics(demographics: dict) -> dict | None:
+    """P2-2（2026-08-18）：demographics 子字段基础 Schema 校验（fail-closed）。
+
+    校验 age_years（非负有限数值）、sex（M/F）、ckd_stage（CKD1-5/G1-5 分期）、
+    dialysis_mode（none/hemodialysis/peritoneal）；None/缺省跳过（未提供合法）。
+    返回 INVALID_INPUT 信封或 None。
+    """
+    _SEX = ("M", "F")
+    _STAGES = ("CKD1", "CKD2", "CKD3", "CKD4", "CKD5",
+               "G1", "G2", "G3A", "G3B", "G4", "G5")
+    _DM = ("none", "hemodialysis", "peritoneal")
+    age = demographics.get("age_years")
+    if age is not None:
+        if isinstance(age, bool) or not isinstance(age, (int, float)) \
+                or not math.isfinite(float(age)) or float(age) < 0:
+            return {"ok": False, "error": "INVALID_INPUT",
+                    "detail": f"demographics.age_years 必须为非负有限数值，收到：{age!r}"}
+    sex = demographics.get("sex")
+    if sex is not None and str(sex).strip().upper() not in _SEX:
+        return {"ok": False, "error": "INVALID_INPUT",
+                "detail": f"demographics.sex 必须是 M/F，收到：{sex!r}"}
+    stage = demographics.get("ckd_stage")
+    # ckd_stage 是展示字段（811/848 仅透出），上游格式不一（数字 1-5 / "CKD3" / "G3A"），
+    # 基础类型校验即可：int 1-5 或非空字符串；不强制单一枚举（防误伤合法变体）。
+    if stage is not None:
+        if isinstance(stage, bool) or not isinstance(stage, (int, str)):
+            return {"ok": False, "error": "INVALID_INPUT",
+                    "detail": f"demographics.ckd_stage 必须为分期编号（1-5）或分期字符串，"
+                              f"收到：{stage!r}"}
+        if isinstance(stage, int) and not (1 <= stage <= 5):
+            return {"ok": False, "error": "INVALID_INPUT",
+                    "detail": f"demographics.ckd_stage 数字分期必须在 1-5，收到：{stage!r}"}
+        if isinstance(stage, str) and not stage.strip():
+            return {"ok": False, "error": "INVALID_INPUT",
+                    "detail": "demographics.ckd_stage 不能为空字符串"}
+    dm = demographics.get("dialysis_mode")
+    if dm is not None and str(dm).strip().lower() not in _DM:
+        return {"ok": False, "error": "INVALID_INPUT",
+                "detail": f"demographics.dialysis_mode 必须是 {'/'.join(_DM)} 之一，"
+                          f"收到：{dm!r}"}
+    return None
+
+
 def _ensure_list(value: Any, name: str) -> list:
     """P1-2（2026-08-18）：pew_history 入口类型检查——str 会被逐字符解析、
     dict 被静默吞掉，显式要求 list；None → []。
@@ -697,6 +772,12 @@ def generate_patient_report(patient_id: str, demographics: dict, lab_summary: di
     nutrition_assessment = _ensure_dict(nutrition_assessment, "nutrition_assessment")
     followup_summary = _ensure_dict(followup_summary, "followup_summary")
     ph = _ensure_list(pew_history, "pew_history")
+    # P2-2（2026-08-18）：demographics 子字段基础 Schema 强校验（fail-closed）——
+    # 此前仅校验顶层 dict，age_years:"abc"/sex:[] 透传进报告打印（数据语义失真、
+    # 家长侧显示乱码值）。非法即 INVALID_INPUT，不静默透传。
+    _dm_err = _validate_demographics(demographics)
+    if _dm_err is not None:
+        return _dm_err
     # BUG-66 后补（2026-08-12）：透明化——trend 仅基于日期有效点计算，count 若用原始
     # len(ph) 会掩盖"10 条记录仅 2 条有效"的数据质量问题；用 _pew_trend_info 同时
     # 暴露 valid_count（参与计算点数）与 total_count（原始记录数）。
@@ -816,12 +897,23 @@ def generate_patient_report(patient_id: str, demographics: dict, lab_summary: di
         # 历史最高等级单独呈现，避免信息丢失。
         _pew_hist_note = (f"\n- 当前等级：{pew_info['current_level']}　"
                           f"历史最高：{pew_info['historical_peak']}")
+    # P1-1（2026-08-18）：无效原因分类提示——此前统一"日期格式无效"误导
+    # （风险等级非法/缺 level/非 dict 被归为日期错误，医疗语义失真）。
+    _invalid_parts = []
+    if pew_info.get("invalid_date_count"):
+        _invalid_parts.append(f"{pew_info['invalid_date_count']} 条日期无效")
+    if pew_info.get("invalid_level_count"):
+        _invalid_parts.append(f"{pew_info['invalid_level_count']} 条风险等级无效")
+    if pew_info.get("invalid_type_count"):
+        _invalid_parts.append(f"{pew_info['invalid_type_count']} 条格式非法")
+    _invalid_note = ""
+    if invalid_count and _invalid_parts:
+        _invalid_note = f"\n- 提示：{('、'.join(_invalid_parts))}，未参与趋势计算"
     lines.append(_section(
         "五、PEW 历史",
         f"- 历史点数：{pew_info['valid_count']}/{pew_info['total_count']}（有效/总数）　趋势：{trend}"
         + _pew_hist_note
-        + (f"\n- 提示：{invalid_count} 条记录日期格式无效，未参与趋势计算"
-           if pew_info["valid_count"] < pew_info["total_count"] else "")))
+        + _invalid_note))
     # 六审：未知风险等级在 markdown 中显式提示（不静默展示为"稳定"）
     risk_line = f"- 等级：{risk_level}"
     if risk_unknown:
@@ -849,9 +941,13 @@ def generate_patient_report(patient_id: str, demographics: dict, lab_summary: di
 def _md_escape(value: Any) -> str:
     """B2（2026-08-15）：markdown 值转义——化验备注/医生备注等自由文本可含换行或
     markdown 元字符（#、*、`、[、]、| 等），直接插值可篡改报告结构（注入标题/列表/
-    代码块/表格）。换行折叠为空格（保持单行条目语义），元字符转义为字面量。"""
+    代码块/表格）。换行折叠为空格（保持单行条目语义），元字符转义为字面量。
+    P2-3（2026-08-18）：**先 html.escape 再 md 转义**——此前不处理 <script> 等 HTML
+    标签，支持 HTML 渲染的前端存在 XSS 风险；html.escape 处理 & < > " '（在 md
+    转义前做，避免引入的实体被后续转义破坏）。"""
     text = str(value if value is not None else "")
     text = text.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+    text = html.escape(text)  # P2-3：HTML 标签/实体转义（XSS 防护）
     return (text.replace("\\", "\\\\").replace("`", "\\`").replace("*", "\\*")
             .replace("_", "\\_").replace("[", "\\[").replace("]", "\\]")
             .replace("#", "\\#").replace(">", "\\>").replace("|", "\\|"))

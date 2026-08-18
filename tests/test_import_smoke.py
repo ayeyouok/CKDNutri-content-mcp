@@ -167,3 +167,84 @@ if __name__ == "__main__":
     test_empty_query_note()
     test_s4_parent_masking()
     print("P5 SMOKE OK")
+
+
+# ---- 十七审（2026-08-18）：P1-1 PEW 分类 / P1-2 strip / P1-3 锁 / P2-1 limit / P2-2 demographics / P2-3 HTML ----
+
+
+def test_ct_p11_pew_invalid_categorized():
+    """P1-1：PEW 无效记录按原因分类（日期/等级/格式），不再统一归"日期格式无效"。"""
+    from CKDNutri_content_mcp.core import _pew_trend_info
+
+    info = _pew_trend_info([
+        {"date": "2026-08-01", "level": "low"},
+        {"date": "bad-date", "level": "high"},       # 日期无效
+        {"date": "2026-08-05", "level": "nonsense"},  # 等级无效
+        "corrupt",                                     # 非 dict
+        {"date": "2026-08-10", "level": "high"},
+    ])
+    assert info["valid_count"] == 2, info
+    assert info["invalid_date_count"] == 1, info
+    assert info["invalid_level_count"] == 1, info
+    assert info["invalid_type_count"] == 1, info
+
+
+def test_ct_p12_citation_strip():
+    """P1-2：get_citation 对带首尾空格的 ref_id 归一化后命中（此前匹配失败 NOT_FOUND）。"""
+    from CKDNutri_content_mcp.core import get_citation
+
+    r = get_citation("  PRNT2020-ENERGY  ")
+    assert r["ok"] is True, r
+
+
+def test_ct_p13_cross_ids_lock():
+    """P1-3：_validate_cross_file_ids 有并发锁保护（double-checked locking 可重复调用）。"""
+    from CKDNutri_content_mcp import core
+
+    assert hasattr(core, "_CROSS_IDS_LOCK")
+    core._CROSS_IDS_CHECKED = False  # 重置后二次校验应正常完成
+    core._validate_cross_file_ids()
+    core._validate_cross_file_ids()  # 幂等可重复
+
+
+def test_ct_p21_search_limit_fields():
+    """P2-1：search_guideline/search_sop 返回 requested_limit/effective_limit/truncated。"""
+    from CKDNutri_content_mcp import core
+
+    for fn in (core.search_guideline, core.search_sop):
+        r = fn("CKD", limit=500)  # 超过 100 上限 → 钳制
+        assert r["ok"] is True, r
+        d = r["data"]
+        assert d["requested_limit"] == 500, d
+        assert d["effective_limit"] == 100, d
+        assert d["truncated"] in (True, False), d
+
+
+def test_ct_p22_demographics_schema():
+    """P2-2：demographics 非法子字段拒绝（age_years 非数值 / sex 非法 / ckd_stage bool）。"""
+    from CKDNutri_content_mcp import core
+
+    base = dict(patient_id="P0010",
+                lab_summary={}, nutrition_assessment={}, followup_summary={},
+                pew_history=[], risk_level="low")
+    r = core.generate_patient_report(**base,
+                                    demographics={"age_years": "abc", "sex": "M",
+                                                  "ckd_stage": 3, "dialysis_mode": "none"})
+    assert r["ok"] is False and r["error"] == "INVALID_INPUT", r
+    r = core.generate_patient_report(**base,
+                                    demographics={"age_years": 6, "sex": "X",
+                                                  "ckd_stage": 3, "dialysis_mode": "none"})
+    assert r["ok"] is False and r["error"] == "INVALID_INPUT", r
+    r = core.generate_patient_report(**base,
+                                    demographics={"age_years": 6, "sex": "M",
+                                                  "ckd_stage": True, "dialysis_mode": "none"})
+    assert r["ok"] is False and r["error"] == "INVALID_INPUT", r
+
+
+def test_ct_p23_md_escape_html():
+    """P2-3：_md_escape 转义 HTML 标签（<script> 不再直穿）。"""
+    from CKDNutri_content_mcp.core import _md_escape
+
+    out = _md_escape("<script>alert(1)</script>")
+    assert "<script>" not in out and "&lt;script&gt;" in out, out
+    assert _md_escape("K=5.5") == "K=5.5"  # 正常文本不受影响
