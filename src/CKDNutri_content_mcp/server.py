@@ -46,7 +46,7 @@ def main():
 @mcp.tool
 def search_guideline_tool(keyword: str, guideline_set: Optional[str] = None,
                           limit: int = 20) -> dict[str, Any]:
-    """语义检索指南（按角色视图裁剪：临床=专业语料，家庭=通俗语料）。
+    """关键词检索指南（按角色视图裁剪：临床=专业语料，家庭=通俗语料）。
     limit（P2 修复 2026-08-13）：结果上限（默认 20、上限 100），防全量命中灌爆上下文。"""
     try:
         return _core.search_guideline(keyword, guideline_set, limit=limit)

@@ -89,3 +89,100 @@ def test_s4b_parent_masking_real_clinician_keys():
     # （剥除逻辑由 _mask_clinician_fields 按清单处理），此处验证 payload 结构完整。
     unmasked = payload
     assert "haz" in unmasked
+
+
+def test_p01_unknown_risk_level_not_stable():
+    """P0-1（2026-08-18）：未知/非法 risk_level 严禁回退 stable——_derive_status
+    对垃圾等级（"L9"/"garbage"）必须返回 caution（需关注）而非 stable（Fail-Open）。"""
+    from CKDNutri_content_mcp import core
+
+    st = core._derive_status("garbage", [], {})
+    assert st == "caution", st
+    st2 = core._derive_status("L9", [], {})
+    assert st2 == "caution", st2
+    # 合法等级映射不变
+    assert core._derive_status("L1", [], {}) == "critical"
+    assert core._derive_status("L0", [], {}) == "stable"
+
+
+def test_p02_pew_trend_first_last_not_peak():
+    """P0-2（2026-08-18）：PEW 趋势解耦——历史出现过 L1（critical）但已完全恢复
+    （low→critical→low）时 trend 必须为 stable（不再"历史永久恶化"），历史峰值单独
+    暴露在 historical_peak、当前等级在 current_level。"""
+    from CKDNutri_content_mcp import core
+
+    hist = [
+        {"date": "2026-06-01", "level": "low"},
+        {"date": "2026-07-01", "level": "critical"},
+        {"date": "2026-08-01", "level": "low"},
+    ]
+    info = core._pew_trend_info(hist)
+    assert info["trend"] == "stable", info  # 修复前（peak 逻辑）会 worsening
+    assert info["current_level"] == "low", info
+    assert str(info["historical_peak"]).lower() == "critical", info
+    # 近期恶化（尾>首）仍判 worsening（不因解耦而漏报）
+    hist2 = [{"date": "2026-06-01", "level": "low"},
+             {"date": "2026-08-01", "level": "critical"}]
+    assert core._pew_trend_info(hist2)["trend"] == "worsening"
+
+
+def test_p11_limit_unified_validation():
+    """P1-1（2026-08-18）：search_guideline/search_sop limit 统一 _validate_limit——
+    bool/字符串/0/负数一律 InvalidArgumentError（此前两处校验异常类型不一致）。"""
+    from CKDNutri_content_mcp import core
+    from CKDNutri_content_mcp.core import InvalidArgumentError
+
+    for fn in (core.search_guideline, core.search_sop):
+        for bad in (True, "100", 0, -1, 1.5):
+            try:
+                fn("CKD", limit=bad)
+            except InvalidArgumentError:
+                continue
+            raise AssertionError(f"{fn.__name__} limit={bad!r} 未拒绝")
+        assert fn("CKD", limit=5)["ok"] is True
+
+
+def test_p12_report_dict_list_type_guard():
+    """P1-2（2026-08-18）：generate_patient_report 参数类型检查——demographics 传
+    非空 list 必须显式 INVALID_INPUT（此前 `or {}` 放行后 .get() AttributeError
+    被全局捕获掩盖成内部错误）；pew_history 传 dict/str 显式拒绝。"""
+    from CKDNutri_content_mcp import core
+    from CKDNutri_content_mcp.core import InvalidArgumentError
+
+    for bad_demo in ([1, 2], "abc"):
+        try:
+            core.generate_patient_report("P0001", bad_demo, {}, {}, {}, [], "L1")
+        except InvalidArgumentError:
+            continue
+        raise AssertionError(f"demographics={bad_demo!r} 未拒绝")
+    for bad_pew in ({"date": "x"}, "2026-08-01"):
+        try:
+            core.generate_patient_report("P0001", {}, {}, {}, {}, bad_pew, "L1")
+        except InvalidArgumentError:
+            continue
+        raise AssertionError(f"pew_history={bad_pew!r} 未拒绝")
+
+
+def test_p13_citation_refid_validation():
+    """P1-3（2026-08-18）：get_citation ref_id 类型/非空校验——None/空串显式
+    InvalidArgumentError（此前静默返回 NOT_FOUND 语义误导）。"""
+    from CKDNutri_content_mcp import core
+    from CKDNutri_content_mcp.core import InvalidArgumentError
+
+    for bad in (None, "", "   "):
+        try:
+            core.get_citation(bad)
+        except InvalidArgumentError:
+            continue
+        raise AssertionError(f"ref_id={bad!r} 未拒绝")
+
+
+def test_p14_search_count_vs_returned_count():
+    """P1-4（2026-08-18）：search 返回语义——count=命中总数、returned_count=实际
+    返回数（limit 截断时 count > returned_count），避免调用方误解。"""
+    from CKDNutri_content_mcp import core
+
+    d = core.search_guideline("儿童", limit=2)["data"]
+    assert "returned_count" in d, d.keys()
+    assert d["returned_count"] == min(d["count"], 2), d
+    assert d["returned_count"] == len(d["results"]), d

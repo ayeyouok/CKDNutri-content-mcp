@@ -208,6 +208,19 @@ def _validate_guideline_set(guideline_set: Optional[str]) -> Optional[str]:
     return canon
 
 
+def _validate_limit(limit: Any) -> int:
+    """统一 limit 入参校验：int（非 bool）且 ≥1，非法一律 InvalidArgumentError。
+
+    P1-1（2026-08-18）：search_guideline/search_sop 此前对 limit **双重校验且异常
+    类型不一致**（入口抛 InvalidArgumentError、命中统计处又抛裸 ValueError，历史
+    打补丁残留）——统一收敛到本函数单一实现，杜绝两处校验漂移。
+    """
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise InvalidArgumentError(
+            f"limit 必须为 ≥1 的整数，收到：{limit!r}")
+    return limit
+
+
 def search_guideline(query: str, guideline_set: Optional[str] = None,
                      limit: int = 20) -> Dict[str, Any]:
     """检索指南/共识条文。按调用方身份切语料视图；所有结果带 source 出处。
@@ -226,8 +239,8 @@ def search_guideline(query: str, guideline_set: Optional[str] = None,
     # INVALID_INPUT 而非 INTERNAL_ERROR）
     if not isinstance(query, str):
         raise InvalidArgumentError(f"query 必须为字符串，收到 {type(query).__name__}")
-    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
-        raise InvalidArgumentError("limit 必须为 ≥1 的整数")
+    # P1-1（2026-08-18）：limit 统一走 _validate_limit（单一实现，不再双校验双异常）
+    limit = _validate_limit(limit)
     # 四审（2026-08-12）：guideline_set 校验（大小写容错 + 枚举报错）
     guideline_set = _validate_guideline_set(guideline_set)
     guides = _load_guides()
@@ -273,13 +286,16 @@ def search_guideline(query: str, guideline_set: Optional[str] = None,
     # 编排层无法统一按 ok/data 解析。数据形状不变，仅包信封。
     # P2 修复（2026-08-13）：limit 钳制——指南库命中可能数百条，全量进上下文
     # 浪费 token；默认 20、上限 100，超限截断并标注 truncated=true。
-    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
-        raise ValueError("limit 必须为 ≥1 的整数")
+    # P1-1（2026-08-18）：入口 _validate_limit 已校验，此处仅钳制上限（不再重复抛异常）。
     limit = min(limit, 100)
     truncated = len(out) > limit
     return {"ok": True, "data": {
         "query": query, "role": caller, "view": view,
-        "count": len(out), "results": out[:limit],
+        # P1-4（2026-08-18）：count=**命中总数**、returned_count=实际截取返回数——
+        # 此前仅 count 一处，调用方易误解为"实际返回条数"（limit 截断时 count 是
+        # 全量命中数）。新增 returned_count 明确语义，count 保留兼容既有消费者。
+        "count": len(out), "returned_count": min(len(out), limit),
+        "results": out[:limit],
         "truncated": truncated,
         "note": f"命中 {len(out)} 条，已截断返回前 {limit} 条（limit={limit}）" if truncated else None,
     }}
@@ -300,8 +316,8 @@ def search_sop(query: str, limit: int = 20) -> Dict[str, Any]:
     # CT-B2/B4 修复（2026-08-14）：query 类型 + limit 入参校验（归 INVALID_INPUT）
     if not isinstance(query, str):
         raise InvalidArgumentError(f"query 必须为字符串，收到 {type(query).__name__}")
-    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
-        raise InvalidArgumentError("limit 必须为 ≥1 的整数")
+    # P1-1（2026-08-18）：limit 统一走 _validate_limit（单一实现，不再双校验双异常）
+    limit = _validate_limit(limit)
     view = _view_for_caller(caller)
     sops = _load_sops()
     # 四审（2026-08-12）：空关键词显式提示（与 search_guideline 同口径）
@@ -337,11 +353,13 @@ def search_sop(query: str, limit: int = 20) -> Dict[str, Any]:
             })
     # S1（2026-08-12 五包审查）：统一 {ok, data} 信封（与 search_guideline 同口径）
     # P2 修复（2026-08-13）：limit 钳制（默认 20、上限 100，超限截断标注 truncated）
-    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
-        raise ValueError("limit 必须为 ≥1 的整数")
+    # P1-1（2026-08-18）：入口 _validate_limit 已校验，此处仅钳制上限。
     limit = min(limit, 100)
     truncated = len(out) > limit
-    return {"ok": True, "data": {"query": query, "count": len(out), "results": out[:limit],
+    return {"ok": True, "data": {"query": query,
+                                 # P1-4（2026-08-18）：count=命中总数、returned_count=实际返回数
+                                 "count": len(out), "returned_count": min(len(out), limit),
+                                 "results": out[:limit],
                                  "truncated": truncated,
                                  "note": (f"命中 {len(out)} 条，已截断返回前 {limit} 条"
                                           f"（limit={limit}）" if truncated else None)}}
@@ -357,6 +375,11 @@ def get_citation(ref_id: str) -> Dict[str, Any]:
     """
     caller = get_caller()
     enforce_read(MCP_NAME)
+    # P1-3（2026-08-18）：ref_id 类型 + 非空校验——此前 None/非 str 静默走循环
+    # 比较返回 NOT_FOUND（"未找到"而非"参数错误"，语义误导）；空串同样无意义。
+    if not isinstance(ref_id, str) or not ref_id.strip():
+        raise InvalidArgumentError(
+            f"ref_id 必须为非空字符串，收到：{ref_id!r}")
     _validate_cross_file_ids()
     guides = _load_guides()
     for e in guides["entries"]:
@@ -464,21 +487,29 @@ def _pew_trend_info(pew_history: list[dict]) -> Dict[str, Any]:
             continue
         dated.append((dt, p))
     if len(dated) < 2:
-        return {"trend": "no_data", "valid_count": len(dated), "total_count": len(pts)}
+        return {"trend": "no_data", "valid_count": len(dated), "total_count": len(pts),
+                "current_level": None, "historical_peak": None}
     dated.sort(key=lambda x: x[0])
     fo = _PEW_ORDER[str(dated[0][1].get("level")).strip().lower()]
-    # M（2026-08-16，第七轮审查）：趋势 = 首点 vs **全程最高严重度**——此前只比
-    # 首尾两点，low→critical→low 被压成 stable（中间出现过危急但首尾回落，低估风险）。
-    # 出现过比首点更严重的 → worsening（即使尾点回落）；否则按首尾比较。
-    peak = max(_PEW_ORDER[str(p[1].get("level")).strip().lower()] for p in dated)
     lo = _PEW_ORDER[str(dated[-1][1].get("level")).strip().lower()]
-    if peak > fo:
+    # P0-2（2026-08-18）：**解耦"当前风险 / 历史最高 / 发展趋势"三概念**——
+    # 此前趋势 = 首点 vs 全程最高严重度（peak=max）：患者历史出现过 L1（哪怕早已
+    # 完全恢复）也永远 worsening，最终状态被历史峰值错误抬高（"历史病情永久恶化"
+    # 误判，修复前 M 注释自述行为）。现：
+    #   - trend：仅首尾比较（近期变化，lo vs fo）；
+    #   - current_level：当前（最新有效点）等级，供报告透明展示；
+    #   - historical_peak：全程最高等级，**只做透明展示**（历史高风险背景仍可见），
+    #     不再直接驱动状态抬升（当前状态由当前风险 + 近期趋势决定）。
+    if lo > fo:
         trend = "worsening"
     elif lo < fo:
         trend = "improving"
     else:
         trend = "stable"
-    return {"trend": trend, "valid_count": len(dated), "total_count": len(pts)}
+    _peak_entry = max(dated, key=lambda x: _PEW_ORDER[str(x[1].get("level")).strip().lower()])
+    return {"trend": trend, "valid_count": len(dated), "total_count": len(pts),
+            "current_level": dated[-1][1].get("level"),
+            "historical_peak": _peak_entry[1].get("level")}
 
 
 def _pew_trend(pew_history: list[dict]) -> str:
@@ -509,7 +540,11 @@ def _derive_status(risk_level: str, pew_history: list[dict],
     # 不再用原始 risk_level 作 dict 键。
     rl = re.sub(r"[^a-z0-9]", "", str(risk_level or "").lower())
     key = rl.upper() if rl in ("l0", "l1", "l2", "l3") else rl
-    base = _RISK_TO_STATUS.get(key, "stable")
+    # P0-1（2026-08-18）：未知/非法 risk_level **严禁回退 stable**——医疗 Fail-Open：
+    # 数据异常时显示"稳定"会掩盖真实风险（如 "L9"/垃圾串被展示为"稳定"）。
+    # 未命中映射 → "caution"（需关注，宁可多报不漏报），配合调用方 risk.valid=false
+    # 透明标注（generate_patient_report 六审逻辑）双保险。
+    base = _RISK_TO_STATUS.get(key, "caution")
     # PEW 恶化 → 阶梯提升（BUG-66 后补 ❷，2026-08-12）：
     # stable→caution、caution→critical——此前仅 stable 提升，M8 判 L2(caution) 且 PEW
     # 恶化至危急时报告停留在"需关注"，低估风险。三档状态中 caution 上调一档即 critical
@@ -572,6 +607,29 @@ def _mask_clinician_fields(value: Any) -> Any:
     return value
 
 
+def _ensure_dict(value: Any, name: str) -> dict:
+    """P1-2（2026-08-18）：入参类型检查——`value or {}` 无法拦截**非空**错误类型
+    （如非空 list/str 保持原值），后续 .get() 抛 AttributeError 被全局捕获掩盖成
+    内部错误。None → {}（空数据处理），非 dict → InvalidArgumentError（显式）。
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise InvalidArgumentError(f"{name} 必须为对象，收到 {type(value).__name__}")
+    return value
+
+
+def _ensure_list(value: Any, name: str) -> list:
+    """P1-2（2026-08-18）：pew_history 入口类型检查——str 会被逐字符解析、
+    dict 被静默吞掉，显式要求 list；None → []。
+    """
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise InvalidArgumentError(f"{name} 必须为列表，收到 {type(value).__name__}")
+    return value
+
+
 # ---- M9: report generation ----
 def generate_patient_report(patient_id: str, demographics: dict, lab_summary: dict,
                             nutrition_assessment: dict, followup_summary: dict,
@@ -597,11 +655,14 @@ def generate_patient_report(patient_id: str, demographics: dict, lab_summary: di
     # BUG-62 后补（2026-08-12）：顶层防空——编排层直调可能传 None（fastmcp 工具层对
     # 必填 dict 形参可能放行显式 null），demographics=None 会在下方 .get() 抛
     # AttributeError。统一 `or {}` 兜底，None/空按无数据处理。
-    demographics = demographics or {}
-    lab_summary = lab_summary or {}
-    nutrition_assessment = nutrition_assessment or {}
-    followup_summary = followup_summary or {}
-    ph = pew_history or []
+    # P1-2（2026-08-18）：`or {}` 无法拦截**非空**错误类型（list/str），显式类型
+    # 校验（_ensure_dict/_ensure_list）——类型不符抛 InvalidArgumentError（归
+    # INVALID_INPUT），不静默吞、不被全局捕获掩盖成内部错误。
+    demographics = _ensure_dict(demographics, "demographics")
+    lab_summary = _ensure_dict(lab_summary, "lab_summary")
+    nutrition_assessment = _ensure_dict(nutrition_assessment, "nutrition_assessment")
+    followup_summary = _ensure_dict(followup_summary, "followup_summary")
+    ph = _ensure_list(pew_history, "pew_history")
     # BUG-66 后补（2026-08-12）：透明化——trend 仅基于日期有效点计算，count 若用原始
     # len(ph) 会掩盖"10 条记录仅 2 条有效"的数据质量问题；用 _pew_trend_info 同时
     # 暴露 valid_count（参与计算点数）与 total_count（原始记录数）。
@@ -652,6 +713,11 @@ def generate_patient_report(patient_id: str, demographics: dict, lab_summary: di
             "count": pew_info["valid_count"],
             "total_records": pew_info["total_count"],
             "trend": trend,
+            # P0-2（2026-08-18）：当前等级与历史最高等级透明化——趋势已改为"近期
+            # 首尾变化"，历史高风险背景不参与状态抬升但不可丢失（医生/家长可见
+            # 患者历史出现过的最严重 PEW 等级）。
+            "current_level": pew_info["current_level"],
+            "historical_peak": pew_info["historical_peak"],
             # M-2（2026-08-16，十一审）：架构语言不进家长上下文——此前 source 硬编码
             # "M3 (ADR-007)"（内部模块编号），家长报告暴露架构语言。改中性描述。
             "source": "PEW 历史（营养评估）",
@@ -709,9 +775,18 @@ def generate_patient_report(patient_id: str, demographics: dict, lab_summary: di
     # BUG-66 后补（2026-08-12）：无效记录数 = total - valid——此前误用 valid_count 显示
     # "N 条无效"，数据质量越差（有效点越少）显示的"无效"反而越少，严重误导可信度判断。
     invalid_count = pew_info["total_count"] - pew_info["valid_count"]
+    _pew_hist_note = ""
+    if pew_info["historical_peak"] is not None and \
+            str(pew_info["historical_peak"]).strip().lower() != \
+            str(pew_info.get("current_level") or "").strip().lower():
+        # P0-2（2026-08-18）：历史峰值透明展示——趋势不再携带"历史永久恶化"语义，
+        # 历史最高等级单独呈现，避免信息丢失。
+        _pew_hist_note = (f"\n- 当前等级：{pew_info['current_level']}　"
+                          f"历史最高：{pew_info['historical_peak']}")
     lines.append(_section(
         "五、PEW 历史",
         f"- 历史点数：{pew_info['valid_count']}/{pew_info['total_count']}（有效/总数）　趋势：{trend}"
+        + _pew_hist_note
         + (f"\n- 提示：{invalid_count} 条记录日期格式无效，未参与趋势计算"
            if pew_info["valid_count"] < pew_info["total_count"] else "")))
     # 六审：未知风险等级在 markdown 中显式提示（不静默展示为"稳定"）
