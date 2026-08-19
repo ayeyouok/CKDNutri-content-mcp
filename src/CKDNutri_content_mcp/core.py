@@ -11,7 +11,6 @@ import html
 import json
 import math
 import os
-import re
 import threading
 from datetime import datetime, timezone
 from typing import Any
@@ -562,24 +561,28 @@ def _pew_trend_info(pew_history: list[dict]) -> dict[str, Any]:
     dated.sort(key=lambda x: x[0])
     # 审查 P2-1（2026-08-18）：同一时间点多条记录 canonical 化——此前仅按日期
     # 稳定排序后取首尾，同日期多条记录时结果依赖输入顺序（[L1,L3] vs [L3,L1]
-    # 得到不同 current_level/trend，deterministic 问题）。现按日期分组，组内取
+    # 得到不同 current_level/trend，deterministic 问题）。按时间点分组，组内取
     # **风险等级最高者**为该时间点 canonical 等级；趋势/当前/峰值均基于
     # canonical 序列，与输入顺序无关。同时统计重复/冲突供上游追溯数据质量。
-    by_day: dict[Any, dict[str, Any]] = {}
+    # 审查（2026-08-19，content 审查 一）：**重复判定基于完整 timestamp 而非日期**——
+    # 旧 `dt.date()` 把同日不同时刻（08:00 / 18:00）误并为同一时间点，同日内部风险
+    # 变化丢失（valid_count/current_level/trend 全部可能错误）。现以完整 datetime
+    # 为唯一键：**完全相同的 timestamp** 才算重复（_parse_pew_date 已统一 UTC，
+    # 不同时区的同一时刻解析后相等）；duplicate_timestamp_count 命名与语义一致。
+    by_timestamp: dict[Any, dict[str, Any]] = {}
     for dt, p in dated:
-        d = dt.date()
         lv = _PEW_ORDER[str(p.get("level")).strip().lower()]
-        slot = by_day.get(d)
+        slot = by_timestamp.get(dt)
         if slot is None:
-            by_day[d] = {"lv": lv, "entry": p, "levels": {lv}}
+            by_timestamp[dt] = {"lv": lv, "entry": p, "levels": {lv}}
         else:
             slot["levels"].add(lv)
             if lv > slot["lv"]:
                 slot["lv"] = lv
                 slot["entry"] = p
-    duplicate_timestamp_count = len(dated) - len(by_day)
-    conflict_count = sum(1 for s in by_day.values() if len(s["levels"]) > 1)
-    canon = [by_day[d] for d in sorted(by_day)]
+    duplicate_timestamp_count = len(dated) - len(by_timestamp)
+    conflict_count = sum(1 for s in by_timestamp.values() if len(s["levels"]) > 1)
+    canon = [by_timestamp[t] for t in sorted(by_timestamp)]
     fo = canon[0]["lv"]
     lo = canon[-1]["lv"]
     # P0-2（2026-08-18）：**解耦"当前风险 / 历史最高 / 发展趋势"三概念**——
@@ -662,13 +665,18 @@ def _derive_status(risk_level: str, pew_history: list[dict],
     # 缺省 None 时内部自算（保持独立调用兼容）。
     # BUG-62（2026-08-12）：risk_level 大小写归一化——"HIGH"/"l1" 等变体若直接
     # _RISK_TO_STATUS.get 失败会静默回退 stable（fail-open 掩盖真实风险）。
-    # BUG-66（2026-08-12）：剥离非字母数字字符——"L 1"/"L-1"/"L1!" 等带分隔符变体
-    # 归一化后与 "l1" 一致（旧逻辑 "L 1".strip().lower()="l 1" 查不到 → stable 漏报危急）。
+    # 审查（2026-08-19，content 审查 二）：**废除字符剥离式清洗**——旧
+    # `re.sub(r"[^a-z0-9]", "", ...)` 会把 "L!!!1"/"L-1"/"L 1" 等**非法格式**强行
+    # 变成合法 "l1"（医疗风险等级判定中，非法输入被自动转换成合法等级是不安全的）。
+    # 现仅做 strip().lower()（不删除任何字符），严格白名单匹配：合法值
+    # l0/l1/l2/l3/low/medium/high/critical/caution/stable/none 才解析；
+    # "L-1"/"L 1"/"L!!!1" 等不在白名单 → fallback "caution" + 调用方 risk.valid=false
+    # 标注（未知输入拒绝/忽略，不强行转换）。
     # P5（2026-08-15）：**不可哈希类型 TypeError**——risk_level 为 list/dict 时
     # _RISK_TO_STATUS.get(risk_level)（dict.get 非字符串键）抛 unhashable TypeError
     # → 报告生成整段崩溃。统一用已归一化字符串 key 查询（str() 转换兜底），
     # 不再用原始 risk_level 作 dict 键。
-    rl = re.sub(r"[^a-z0-9]", "", str(risk_level or "").lower())
+    rl = str(risk_level or "").strip().lower()
     key = rl.upper() if rl in ("l0", "l1", "l2", "l3") else rl
     # P0-1（2026-08-18）：未知/非法 risk_level **严禁回退 stable**——医疗 Fail-Open：
     # 数据异常时显示"稳定"会掩盖真实风险（如 "L9"/垃圾串被展示为"稳定"）。
@@ -770,7 +778,13 @@ def _validate_demographics(demographics: dict) -> None:
                 f"demographics.age_years 必须为非负有限数值，收到：{age!r}")
     sex = demographics.get("sex")
     if sex is not None:
-        sex_norm = str(sex).strip().upper()
+        # 审查（2026-08-19，content 审查 三）：先严格类型校验再 strip/upper——
+        # 旧 `str(sex)` 会把任意对象（123、[]、{"m": 1}）强转成字符串再参与判断，
+        # 不是严格的输入类型验证。sex 语义是单字符枚举，非 str 一律拒绝。
+        if not isinstance(sex, str):
+            raise InvalidArgumentError(
+                f"demographics.sex 必须为字符串（M/F），收到：{type(sex).__name__} {sex!r}")
+        sex_norm = sex.strip().upper()
         if sex_norm not in _SEX:
             raise InvalidArgumentError(
                 f"demographics.sex 必须是 M/F，收到：{sex!r}")
@@ -797,7 +811,12 @@ def _validate_demographics(demographics: dict) -> None:
             demographics["ckd_stage"] = canon_stage
     dm = demographics.get("dialysis_mode")
     if dm is not None:
-        dm_norm = str(dm).strip().lower()
+        # 审查（2026-08-19，content 审查 三）：先严格类型校验（同 sex 口径）——
+        # 旧 `str(dm)` 对任意对象强转字符串，非严格类型验证。
+        if not isinstance(dm, str):
+            raise InvalidArgumentError(
+                f"demographics.dialysis_mode 必须为字符串，收到：{type(dm).__name__} {dm!r}")
+        dm_norm = dm.strip().lower()
         if dm_norm not in _DM:
             raise InvalidArgumentError(
                 f"demographics.dialysis_mode 必须是 {'/'.join(_DM)} 之一，"
@@ -870,7 +889,9 @@ def generate_patient_report(patient_id: str, demographics: dict, lab_summary: di
     # 六审（2026-08-13）：未知风险等级显式标注——_derive_status 对非法 risk_level
     # 静默归 stable（fail-open 掩盖真实风险，如 "L9" 会被展示为"稳定"），报告必须
     # 透明化：未知等级标注 risk.valid=false 并在 markdown 中提示核对上游。
-    rl_norm = re.sub(r"[^a-z0-9]", "", str(risk_level or "").lower())
+    # 审查（2026-08-19）：清洗与 _derive_status 同口径（strip().lower()，不删字符）——
+    # "L!!!1"/"L-1"/"L 1" 等非法格式不再被强行洗成合法等级，直接判 unknown。
+    rl_norm = str(risk_level or "").strip().lower()
     risk_unknown = rl_norm not in ("l0", "l1", "l2", "l3", "low", "medium", "high",
                                    "critical", "caution", "stable", "none")
     # F7（2026-08-17，十二审）：**营养评估未评估透明化**——空 nutrition dict 时
@@ -961,8 +982,18 @@ def generate_patient_report(patient_id: str, demographics: dict, lab_summary: di
     plans = _fu.get("plans")
     if isinstance(plans, (list, tuple, dict, set)):
         plans_count = len(plans)
-    elif isinstance(plans, (int, float)) and not isinstance(plans, bool):
-        plans_count = int(plans)
+    elif isinstance(plans, int) and not isinstance(plans, bool):
+        # 审查（2026-08-19，content 审查 四）：计划数只接受**非负整数**——旧
+        # `int(plans)` 对 float（3.9→3）静默截断、对负数（-10）照单全收（报告可
+        # 出现"进行中计划数：-10"）。整数语义拒绝 float/负值（fail-closed）。
+        if plans < 0:
+            raise InvalidArgumentError(
+                f"followup_summary.plans 数值不能为负，收到：{plans!r}")
+        plans_count = plans
+    elif isinstance(plans, float) and not isinstance(plans, bool):
+        # float 非整数值（3.9）不再静默截断——显式拒绝（报告计数语义必须精确）
+        raise InvalidArgumentError(
+            f"followup_summary.plans 必须为整数或容器，收到 float：{plans!r}")
     else:
         plans_count = 0
     lines.append(_section(
