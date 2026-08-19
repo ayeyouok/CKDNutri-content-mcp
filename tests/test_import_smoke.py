@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import importlib
 import os
+
 os.environ.setdefault("A207_ENV", "test")  # N-SEC-1（2026-08-14）：测试进程显式声明测试环境（守卫 fail-closed 默认拒绝）
 os.environ.setdefault("A207_ACCEPT_DEV_STORAGE", "1")  # 生产护栏（2026-08-15）：测试进程显式确认 json 后端为开发模式
 import sys
@@ -221,24 +222,31 @@ def test_ct_p21_search_limit_fields():
 
 
 def test_ct_p22_demographics_schema():
-    """P2-2：demographics 非法子字段拒绝（age_years 非数值 / sex 非法 / ckd_stage bool）。"""
+    """P2-2：demographics 非法子字段拒绝（age_years 非数值 / sex 非法 / ckd_stage bool）。
+
+    审查 P2-6（2026-08-18）：core 不直接构造 MCP error envelope——非法入参统一抛
+    InvalidArgumentError（server 层 translate_error 归 INVALID_INPUT），断言由
+    "返回 {ok:false}" 改为 "抛 InvalidArgumentError"。
+    """
+    import pytest
+
     from CKDNutri_content_mcp import core
 
     base = dict(patient_id="P0010",
                 lab_summary={}, nutrition_assessment={}, followup_summary={},
                 pew_history=[], risk_level="low")
-    r = core.generate_patient_report(**base,
-                                    demographics={"age_years": "abc", "sex": "M",
-                                                  "ckd_stage": 3, "dialysis_mode": "none"})
-    assert r["ok"] is False and r["error"] == "INVALID_INPUT", r
-    r = core.generate_patient_report(**base,
-                                    demographics={"age_years": 6, "sex": "X",
-                                                  "ckd_stage": 3, "dialysis_mode": "none"})
-    assert r["ok"] is False and r["error"] == "INVALID_INPUT", r
-    r = core.generate_patient_report(**base,
-                                    demographics={"age_years": 6, "sex": "M",
-                                                  "ckd_stage": True, "dialysis_mode": "none"})
-    assert r["ok"] is False and r["error"] == "INVALID_INPUT", r
+    with pytest.raises(core.InvalidArgumentError):
+        core.generate_patient_report(**base,
+                                     demographics={"age_years": "abc", "sex": "M",
+                                                   "ckd_stage": 3, "dialysis_mode": "none"})
+    with pytest.raises(core.InvalidArgumentError):
+        core.generate_patient_report(**base,
+                                     demographics={"age_years": 6, "sex": "X",
+                                                   "ckd_stage": 3, "dialysis_mode": "none"})
+    with pytest.raises(core.InvalidArgumentError):
+        core.generate_patient_report(**base,
+                                     demographics={"age_years": 6, "sex": "M",
+                                                   "ckd_stage": True, "dialysis_mode": "none"})
 
 
 def test_ct_p23_md_escape_html():

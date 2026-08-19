@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """M12 知识库检索纯函数。
 
 不依赖 fastmcp，可直接 import 单测。数据来自 data/guidelines.json 与 data/sops.json。
@@ -15,7 +14,7 @@ import os
 import re
 import threading
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from a207_policy import (
     CLINICIAN_ONLY_FIELDS,
@@ -44,8 +43,8 @@ _CHILD_SOP_FALLBACK = "该 SOP 仅向临床角色提供；如有不适请告知�
 
 _GUIDE_PATH = os.path.join(os.path.dirname(__file__), "data", "guidelines.json")
 _SOP_PATH = os.path.join(os.path.dirname(__file__), "data", "sops.json")
-_GUIDES: Optional[Dict[str, Any]] = None
-_SOPS: Optional[Dict[str, Any]] = None
+_GUIDES: dict[str, Any] | None = None
+_SOPS: dict[str, Any] | None = None
 # BUG-66 后补（2026-08-12）：跨文件 id 唯一性校验结果缓存（get_citation 入口一次性校验）
 _CROSS_IDS_CHECKED = False
 # P1-3（2026-08-18）：校验标志的并发锁——高并发启动时多线程同时触发重复加载/校验
@@ -83,12 +82,12 @@ def _validate_cross_file_ids() -> None:
         _CROSS_IDS_CHECKED = True
 
 
-def _load_guides() -> Dict[str, Any]:
+def _load_guides() -> dict[str, Any]:
     global _GUIDES
     if _GUIDES is None:
         with _GUIDES_LOCK:
             if _GUIDES is None:  # S3：double-checked locking（对齐 assessment _RULES_LOCK）
-                with open(_GUIDE_PATH, "r", encoding="utf-8") as f:
+                with open(_GUIDE_PATH, encoding="utf-8") as f:
                     data = json.load(f)
                 # BUG-62 后补（2026-08-12）：顶层 'entries' 键校验，对齐 _load_sops 的 'sops' 校验——
                 # 此前 data["entries"] 直接索引，缺键/非列表在加载期抛 KeyError（虽已归 INTERNAL_ERROR，
@@ -125,12 +124,12 @@ def _load_guides() -> Dict[str, Any]:
     return _GUIDES
 
 
-def _load_sops() -> Dict[str, Any]:
+def _load_sops() -> dict[str, Any]:
     global _SOPS
     if _SOPS is None:
         with _SOPS_LOCK:
             if _SOPS is None:  # S3：double-checked locking（对齐 assessment _RULES_LOCK）
-                with open(_SOP_PATH, "r", encoding="utf-8") as f:
+                with open(_SOP_PATH, encoding="utf-8") as f:
                     data = json.load(f)
                 # BUG-56（2026-08-12）：参照 _load_guides 做加载时结构校验（fail-closed）——
                 # 缺必填键直接拒绝加载，避免检索期运行 KeyError。
@@ -176,7 +175,7 @@ def _match(text: str, query: str) -> bool:
     return q in text.lower()
 
 
-def _guideline_set_lookup() -> Dict[str, str]:
+def _guideline_set_lookup() -> dict[str, str]:
     """指南 set 合法值（加载期从数据收集，防硬编码漂移）→ 小写名 → 规范名。"""
     guides = _load_guides()
     return {
@@ -195,7 +194,7 @@ class InvalidArgumentError(ValueError):
     """
 
 
-def _validate_guideline_set(guideline_set: Optional[str]) -> Optional[str]:
+def _validate_guideline_set(guideline_set: str | None) -> str | None:
     """guideline_set 校验 + 大小写容错（四审，2026-08-12）。
 
     - 非字符串/空串 → InvalidArgumentError（fail-closed，防 TypeError 冒泡归
@@ -230,8 +229,8 @@ def _validate_limit(limit: Any) -> int:
     return limit
 
 
-def search_guideline(query: str, guideline_set: Optional[str] = None,
-                     limit: int = 20) -> Dict[str, Any]:
+def search_guideline(query: str, guideline_set: str | None = None,
+                     limit: int = 20) -> dict[str, Any]:
     """检索指南/共识条文。按调用方身份切语料视图；所有结果带 source 出处。
 
     语料视图由部署注入的身份决定（doctor_assistant/nutritionist/risk_warning=全量 full；
@@ -317,7 +316,7 @@ def search_guideline(query: str, guideline_set: Optional[str] = None,
     }}
 
 
-def search_sop(query: str, limit: int = 20) -> Dict[str, Any]:
+def search_sop(query: str, limit: int = 20) -> dict[str, Any]:
     """检索院内 SOP。按调用方身份切语料视图：非临床角色只返回安全/通俗版，不暴露完整临床处置。
 
     语料视图由部署注入的身份决定（与 search_guideline 一致）。BUG-22 修复（2026-08-12）：
@@ -386,7 +385,7 @@ def search_sop(query: str, limit: int = 20) -> Dict[str, Any]:
                                           f"（limit={limit}）" if truncated else None)}}
 
 
-def get_citation(ref_id: str) -> Dict[str, Any]:
+def get_citation(ref_id: str) -> dict[str, Any]:
     """生成规范引用串。支持指南条目 id 与 SOP id。
 
     BUG-66 后补（2026-08-12）：入口先做跨文件 id 唯一性校验——get_citation 按
@@ -394,7 +393,7 @@ def get_citation(ref_id: str) -> Dict[str, Any]:
     视图说明：title/source/strength/evidence 为元数据，对所有读权角色可见（与
     search_guideline/search_sop 返回一致）；视图裁剪只作用于正文 text/content。
     """
-    caller = get_caller()
+    get_caller()  # P0-1 身份校验副作用（未设置/非法 A207_CALLER 抛 CallerUnknown）；本函数返回值未用
     enforce_read(MCP_NAME)
     # P1-3（2026-08-18）：ref_id 类型 + 非空校验——此前 None/非 str 静默走循环
     # 比较返回 NOT_FOUND（"未找到"而非"参数错误"，语义误导）；空串同样无意义。
@@ -425,7 +424,7 @@ def get_citation(ref_id: str) -> Dict[str, Any]:
             "detail": f"未找到引用 ID：{ref_id}", "ref_id": ref_id}
 
 
-def _self_test_refs() -> List[str]:
+def _self_test_refs() -> list[str]:
     """返回所有可被 get_citation 解析的 id（供校验出处完整性）。"""
     guides = _load_guides()
     sops = _load_sops()
@@ -447,6 +446,14 @@ _RISK_TO_STATUS = {
 # 💭（2026-08-12 五包审查）：状态中文映射前移至常量区（此前定义在使用点之后，
 # 依赖模块级运行时查找，可读性差）。
 _STATUS_CN = {"stable": "稳定", "caution": "需关注", "critical": "紧急"}
+
+# 审查 P2-4/P2-5（2026-08-18）：报告渲染资源上限（LLM 防护）——
+# 外部输入可构造深层嵌套（dict→dict→…1000 层触发 RecursionError）或超大 list
+# （["x"]*1000000 灌爆上下文），渲染必须显式截断而非让异常/膨胀穿透到调用方。
+_MAX_RENDER_DEPTH = 20          # Markdown 递归最大深度（超限"（嵌套过深，已省略）"）
+_MAX_LIST_ITEMS = 100           # 单列表最大渲染项数（超限"共 N 项，仅显示前 100 项"）
+_MAX_TEXT_LENGTH = 5000         # 单文本字段最大字符数（超限截断标注）
+_MAX_RENDERED_CHARS = 50000     # 最终报告最大字符数（超限截断标注）
 
 
 # BUG-62/BUG-63（2026-08-12）：等级阶梯——L0(0) < L3(1) < L2(2) < L1(3)，
@@ -470,7 +477,7 @@ def _is_number(value: Any) -> bool:
             and math.isfinite(value))
 
 
-def _parse_pew_date(value: Any) -> Optional[datetime]:
+def _parse_pew_date(value: Any) -> datetime | None:
     """解析 PEW 历史日期为 datetime；无效/缺失返回 None。
 
     上游 M3 契约=ISO 升序（BUG-60 已统一写入归一化），此处防御性解析——"/"、"." 分隔
@@ -507,7 +514,7 @@ def _parse_pew_date(value: Any) -> Optional[datetime]:
     return dt
 
 
-def _pew_trend_info(pew_history: list[dict]) -> Dict[str, Any]:
+def _pew_trend_info(pew_history: list[dict]) -> dict[str, Any]:
     """PEW 趋势计算 + 数据质量透明化（BUG-66 后补 ❶，2026-08-12）。
 
     返回 {trend, valid_count, total_count}：trend 基于日期有效点计算，valid_count/
@@ -548,10 +555,33 @@ def _pew_trend_info(pew_history: list[dict]) -> Dict[str, Any]:
                 "invalid_date_count": invalid_date_count,
                 "invalid_level_count": invalid_level_count,
                 "invalid_type_count": invalid_type_count,
-                "current_level": None, "historical_peak": None}
+                "current_level": None, "historical_peak": None,
+                # 审查 P2-1/P2-2（2026-08-18）：契约统一（无有效点→无重复/冲突/高风险）
+                "duplicate_timestamp_count": 0, "conflict_count": 0,
+                "historical_high_risk": False}
     dated.sort(key=lambda x: x[0])
-    fo = _PEW_ORDER[str(dated[0][1].get("level")).strip().lower()]
-    lo = _PEW_ORDER[str(dated[-1][1].get("level")).strip().lower()]
+    # 审查 P2-1（2026-08-18）：同一时间点多条记录 canonical 化——此前仅按日期
+    # 稳定排序后取首尾，同日期多条记录时结果依赖输入顺序（[L1,L3] vs [L3,L1]
+    # 得到不同 current_level/trend，deterministic 问题）。现按日期分组，组内取
+    # **风险等级最高者**为该时间点 canonical 等级；趋势/当前/峰值均基于
+    # canonical 序列，与输入顺序无关。同时统计重复/冲突供上游追溯数据质量。
+    by_day: dict[Any, dict[str, Any]] = {}
+    for dt, p in dated:
+        d = dt.date()
+        lv = _PEW_ORDER[str(p.get("level")).strip().lower()]
+        slot = by_day.get(d)
+        if slot is None:
+            by_day[d] = {"lv": lv, "entry": p, "levels": {lv}}
+        else:
+            slot["levels"].add(lv)
+            if lv > slot["lv"]:
+                slot["lv"] = lv
+                slot["entry"] = p
+    duplicate_timestamp_count = len(dated) - len(by_day)
+    conflict_count = sum(1 for s in by_day.values() if len(s["levels"]) > 1)
+    canon = [by_day[d] for d in sorted(by_day)]
+    fo = canon[0]["lv"]
+    lo = canon[-1]["lv"]
     # P0-2（2026-08-18）：**解耦"当前风险 / 历史最高 / 发展趋势"三概念**——
     # 此前趋势 = 首点 vs 全程最高严重度（peak=max）：患者历史出现过 L1（哪怕早已
     # 完全恢复）也永远 worsening，最终状态被历史峰值错误抬高（"历史病情永久恶化"
@@ -566,14 +596,22 @@ def _pew_trend_info(pew_history: list[dict]) -> Dict[str, Any]:
         trend = "improving"
     else:
         trend = "stable"
-    _peak_entry = max(dated, key=lambda x: _PEW_ORDER[str(x[1].get("level")).strip().lower()])
+    _peak_entry = max(canon, key=lambda s: s["lv"])
+    _hist_lv = _peak_entry["lv"]
     return {"trend": trend, "valid_count": len(dated), "total_count": total_count,
             # P1-1（2026-08-18）：按原因分类统计（见 no_data 分支注释）。
             "invalid_date_count": invalid_date_count,
             "invalid_level_count": invalid_level_count,
             "invalid_type_count": invalid_type_count,
-            "current_level": dated[-1][1].get("level"),
-            "historical_peak": _peak_entry[1].get("level")}
+            "current_level": canon[-1]["entry"].get("level"),
+            "historical_peak": _peak_entry["entry"].get("level"),
+            # 审查 P2-1：同时间点重复记录数 / 冲突时间点数（上游数据质量追踪）
+            "duplicate_timestamp_count": duplicate_timestamp_count,
+            "conflict_count": conflict_count,
+            # 审查 P2-2（2026-08-18）：历史最高等级是否为高风险（L1/high/critical，
+            # 序=3）——trend 只反映首尾变化，历史中间严重恶化不会进 trend；该机器
+            # 字段不改趋势算法、保留历史高风险提示（与 P0-2 解耦精神一致）。
+            "historical_high_risk": _hist_lv >= _PEW_ORDER["l1"]}
 
 
 def _pew_trend(pew_history: list[dict]) -> str:
@@ -588,9 +626,37 @@ def _pew_trend(pew_history: list[dict]) -> str:
     return _pew_trend_info(pew_history)["trend"]
 
 
+def _extract_energy_achievement_pct(nutrition_assessment: dict) -> float | None:
+    """营养摄入达成率提取**单一事实源**（审查 P2-3，2026-08-18）。
+
+    兼容三种上游结构：① P2 assess_intake_vs_target 实际输出
+    `data.energy.achievement_pct`；② 直接 `energy.achievement_pct`；③ 旧契约
+    `intake.achievement.energy_pct`。返回有限数值（_is_number 保证，bool/NaN/Inf
+    排除），无有效数据返回 None。
+
+    _derive_status（<50% 升级 caution）与 generate_patient_report 的
+    nutrition_valid 共用本函数——此前两处各实现一套解析逻辑，未来 schema
+    变更时极易出现"一处认为有效、另一处认为无效"的 schema drift。
+    """
+    if not isinstance(nutrition_assessment, dict):
+        return None
+    _d = nutrition_assessment.get("data")
+    if isinstance(_d, dict) and isinstance(_d.get("energy"), dict) \
+            and _is_number(_d["energy"].get("achievement_pct")):
+        return float(_d["energy"]["achievement_pct"])
+    if isinstance(nutrition_assessment.get("energy"), dict) \
+            and _is_number(nutrition_assessment["energy"].get("achievement_pct")):
+        return float(nutrition_assessment["energy"]["achievement_pct"])
+    intake = nutrition_assessment.get("intake")
+    ach = (intake.get("achievement") or {}) if isinstance(intake, dict) else {}
+    if _is_number(ach.get("energy_pct")):
+        return float(ach["energy_pct"])
+    return None
+
+
 def _derive_status(risk_level: str, pew_history: list[dict],
                    nutrition_assessment: dict,
-                   pew_trend: Optional[str] = None) -> str:
+                   pew_trend: str | None = None) -> str:
     # BUG-66 后补 ❸（2026-08-12）：可选 pew_trend 参数——generate_patient_report 已
     # 调 _pew_trend_info 算过趋势，传入可避免对小数据列表二次解析排序（性能冗余）。
     # 缺省 None 时内部自算（保持独立调用兼容）。
@@ -620,30 +686,12 @@ def _derive_status(risk_level: str, pew_history: list[dict],
         elif base == "caution":
             base = "critical"
     # 营养摄入达成率过低（<50%）→ 至少 caution
-    # BUG-62：显式 None/dict 处理——{"intake": None} 时旧链式 .get 抛 AttributeError
-    # 被宽 except 吞掉（行为虽对），改显式后不再掩盖其它异常
-    # F-2（2026-08-15）：**键名兼容**——P2 assess_intake_vs_target 实际输出
-    # `data.energy.achievement_pct`，旧链读 `intake.achievement.energy_pct` 永远取不到
-    # → 摄入 <50% 的能量严重不足患儿报告整体仍 "stable"（静默漏报，已实测）。兼容
-    # 三种结构：① P2 实际 data.energy.achievement_pct；② 直接 energy.achievement_pct；
-    # ③ 旧契约 intake.achievement.energy_pct。
-    energy_pct: Any = 100
-    if isinstance(nutrition_assessment, dict):
-        _d = nutrition_assessment.get("data")
-        # P2-2（2026-08-18）：isinstance((int,float)) 会放过 bool（True 当 1）与
-        # NaN/Inf（NaN<50 恒 False 静默不触发）——统一 _is_number 排除。
-        if isinstance(_d, dict) and isinstance(_d.get("energy"), dict) \
-                and _is_number(_d["energy"].get("achievement_pct")):
-            energy_pct = _d["energy"]["achievement_pct"]
-        elif isinstance(nutrition_assessment.get("energy"), dict) \
-                and _is_number(nutrition_assessment["energy"].get("achievement_pct")):
-            energy_pct = nutrition_assessment["energy"]["achievement_pct"]
-        else:
-            intake = nutrition_assessment.get("intake")
-            ach = (intake.get("achievement") or {}) if isinstance(intake, dict) else {}
-            energy_pct = ach.get("energy_pct", 100)
-        if _is_number(energy_pct) and energy_pct < 50 and base == "stable":
-            base = "caution"
+    # 审查 P2-3（2026-08-18）：解析逻辑收敛到 _extract_energy_achievement_pct
+    # 单一事实源（兼容三种上游结构 + _is_number 防 bool/NaN/Inf，见该函数）。
+    # 无有效数据（None）→ 不参与升级（与旧"默认 100 不升级"语义等价）。
+    energy_pct = _extract_energy_achievement_pct(nutrition_assessment)
+    if energy_pct is not None and energy_pct < 50 and base == "stable":
+        base = "caution"
     return base
 
 
@@ -685,47 +733,77 @@ def _ensure_dict(value: Any, name: str) -> dict:
     return value
 
 
-def _validate_demographics(demographics: dict) -> dict | None:
+def _validate_demographics(demographics: dict) -> None:
     """P2-2（2026-08-18）：demographics 子字段基础 Schema 校验（fail-closed）。
 
     校验 age_years（非负有限数值）、sex（M/F）、ckd_stage（CKD1-5/G1-5 分期）、
     dialysis_mode（none/hemodialysis/peritoneal）；None/缺省跳过（未提供合法）。
-    返回 INVALID_INPUT 信封或 None。
+
+    审查 P1-1/P1-2/P1-3（2026-08-18）：**校验通过即 canonicalize 写回原 dict**——
+    此前 sex=" m "/dialysis_mode=" Hemodialysis " 等带空格/大小写变体校验通过但
+    报告层沿用原始值（"报告：m"），同一字段多种表示形式破坏结构化输出稳定性；
+    ckd_stage 字符串此前只查非空，"CKD99"/"banana" 能穿透进患者报告（医疗数据
+    质量问题）。现统一：
+      - sex          → "M" / "F"
+      - ckd_stage    → 白名单枚举（数字 1-5 / CKD1-5 / G1-5 / G3a|G3A / G3b|G3B），
+                       canonical 输出 "G1"~"G5" / "G3a" / "G3b"（对齐 assessment 输出）；
+                       非法值显式抛 InvalidArgumentError
+      - dialysis_mode → "none" / "hemodialysis" / "peritoneal"
+    非法即抛 InvalidArgumentError（server 层 translate_error 归 INVALID_INPUT）。
     """
     _SEX = ("M", "F")
-    _STAGES = ("CKD1", "CKD2", "CKD3", "CKD4", "CKD5",
-               "G1", "G2", "G3A", "G3B", "G4", "G5")
+    # 审查 P1-2：CKD stage 白名单（canonical 映射单一事实源）——数字/CKDx 形式归
+    # G 记法；G3A/G3B 大小写归一为 G3a/G3b（KDIGO 子分期，assessment classify_ckd
+    # 输出同款）；其余任意非空字符串（CKD99/banana/G99）一律拒绝。
+    _STAGE_MAP = {
+        "1": "G1", "2": "G2", "3": "G3", "4": "G4", "5": "G5",
+        "CKD1": "G1", "CKD2": "G2", "CKD3": "G3", "CKD4": "G4", "CKD5": "G5",
+        "G1": "G1", "G2": "G2", "G3": "G3", "G4": "G4", "G5": "G5",
+        "G3A": "G3a", "G3B": "G3b",
+    }
     _DM = ("none", "hemodialysis", "peritoneal")
     age = demographics.get("age_years")
     if age is not None:
         if isinstance(age, bool) or not isinstance(age, (int, float)) \
                 or not math.isfinite(float(age)) or float(age) < 0:
-            return {"ok": False, "error": "INVALID_INPUT",
-                    "detail": f"demographics.age_years 必须为非负有限数值，收到：{age!r}"}
+            raise InvalidArgumentError(
+                f"demographics.age_years 必须为非负有限数值，收到：{age!r}")
     sex = demographics.get("sex")
-    if sex is not None and str(sex).strip().upper() not in _SEX:
-        return {"ok": False, "error": "INVALID_INPUT",
-                "detail": f"demographics.sex 必须是 M/F，收到：{sex!r}"}
+    if sex is not None:
+        sex_norm = str(sex).strip().upper()
+        if sex_norm not in _SEX:
+            raise InvalidArgumentError(
+                f"demographics.sex 必须是 M/F，收到：{sex!r}")
+        # P1-1（2026-08-18）：canonicalize——" m "/"f " 归一为 "M"/"F"，
+        # 报告层/下游只消费 canonical 值，杜绝同字段多表示。
+        demographics["sex"] = sex_norm
     stage = demographics.get("ckd_stage")
-    # ckd_stage 是展示字段（811/848 仅透出），上游格式不一（数字 1-5 / "CKD3" / "G3A"），
-    # 基础类型校验即可：int 1-5 或非空字符串；不强制单一枚举（防误伤合法变体）。
     if stage is not None:
         if isinstance(stage, bool) or not isinstance(stage, (int, str)):
-            return {"ok": False, "error": "INVALID_INPUT",
-                    "detail": f"demographics.ckd_stage 必须为分期编号（1-5）或分期字符串，"
-                              f"收到：{stage!r}"}
-        if isinstance(stage, int) and not (1 <= stage <= 5):
-            return {"ok": False, "error": "INVALID_INPUT",
-                    "detail": f"demographics.ckd_stage 数字分期必须在 1-5，收到：{stage!r}"}
-        if isinstance(stage, str) and not stage.strip():
-            return {"ok": False, "error": "INVALID_INPUT",
-                    "detail": "demographics.ckd_stage 不能为空字符串"}
+            raise InvalidArgumentError(
+                f"demographics.ckd_stage 必须为分期编号（1-5）或分期字符串，"
+                f"收到：{stage!r}")
+        if isinstance(stage, int):
+            if not (1 <= stage <= 5):
+                raise InvalidArgumentError(
+                    f"demographics.ckd_stage 数字分期必须在 1-5，收到：{stage!r}")
+            demographics["ckd_stage"] = f"G{stage}"
+        else:
+            canon_stage = _STAGE_MAP.get(str(stage).strip().upper())
+            if canon_stage is None:
+                raise InvalidArgumentError(
+                    f"demographics.ckd_stage={stage!r} 非法：仅允许 CKD1-5 / G1-5"
+                    "（含 G3a/G3b 子分期）或数字 1-5，收到非白名单值")
+            demographics["ckd_stage"] = canon_stage
     dm = demographics.get("dialysis_mode")
-    if dm is not None and str(dm).strip().lower() not in _DM:
-        return {"ok": False, "error": "INVALID_INPUT",
-                "detail": f"demographics.dialysis_mode 必须是 {'/'.join(_DM)} 之一，"
-                          f"收到：{dm!r}"}
-    return None
+    if dm is not None:
+        dm_norm = str(dm).strip().lower()
+        if dm_norm not in _DM:
+            raise InvalidArgumentError(
+                f"demographics.dialysis_mode 必须是 {'/'.join(_DM)} 之一，"
+                f"收到：{dm!r}")
+        # P1-3（2026-08-18）：canonicalize（同上）
+        demographics["dialysis_mode"] = dm_norm
 
 
 def _ensure_list(value: Any, name: str) -> list:
@@ -757,10 +835,13 @@ def generate_patient_report(patient_id: str, demographics: dict, lab_summary: di
     caller = get_caller()
     enforce_read(MCP_NAME)
     # N1 修复（2026-08-13）：统一 patient_id 契约校验（畸形 id 不进报告生成）
+    # 审查 P2-6（2026-08-18）：core 不直接构造 MCP error envelope——统一抛
+    # InvalidArgumentError，由 server 层 translate_error 归 INVALID_INPUT。
     try:
         patient_id = validate_patient_id(patient_id)
     except ValueError as exc:
-        return {"ok": False, "error": "INVALID_INPUT", "detail": str(exc)}
+        # 保留原始校验异常链（B904），便于排障定位具体校验规则
+        raise InvalidArgumentError(str(exc)) from exc
     # BUG-62 后补（2026-08-12）：顶层防空——编排层直调可能传 None（fastmcp 工具层对
     # 必填 dict 形参可能放行显式 null），demographics=None 会在下方 .get() 抛
     # AttributeError。统一 `or {}` 兜底，None/空按无数据处理。
@@ -775,9 +856,9 @@ def generate_patient_report(patient_id: str, demographics: dict, lab_summary: di
     # P2-2（2026-08-18）：demographics 子字段基础 Schema 强校验（fail-closed）——
     # 此前仅校验顶层 dict，age_years:"abc"/sex:[] 透传进报告打印（数据语义失真、
     # 家长侧显示乱码值）。非法即 INVALID_INPUT，不静默透传。
-    _dm_err = _validate_demographics(demographics)
-    if _dm_err is not None:
-        return _dm_err
+    # 审查 P1-1/P1-2/P1-3（2026-08-18）：校验通过即就地 canonicalize（sex→M/F、
+    # ckd_stage→G 记法白名单、dialysis_mode→小写枚举），非法抛 InvalidArgumentError。
+    _validate_demographics(demographics)
     # BUG-66 后补（2026-08-12）：透明化——trend 仅基于日期有效点计算，count 若用原始
     # len(ph) 会掩盖"10 条记录仅 2 条有效"的数据质量问题；用 _pew_trend_info 同时
     # 暴露 valid_count（参与计算点数）与 total_count（原始记录数）。
@@ -797,16 +878,9 @@ def generate_patient_report(patient_id: str, demographics: dict, lab_summary: di
     # （与 risk.valid 不对称）。现标注 nutrition_valid=false：nutrition_assessment 为
     # 空/无 data.energy.achievement_pct 时表示摄入数据缺失，报告显式提示"未评估"，
     # 不把"没数据"当"达成 100%"。
-    _na = nutrition_assessment if isinstance(nutrition_assessment, dict) else {}
-    _na_data = _na.get("data") if isinstance(_na.get("data"), dict) else {}
-    nutrition_valid = (
-        isinstance(_na_data.get("energy"), dict)
-        and _is_number(_na_data["energy"].get("achievement_pct"))) \
-        or (
-            isinstance(_na.get("energy"), dict)
-            and _is_number(_na["energy"].get("achievement_pct"))) \
-        or (isinstance(_na.get("intake"), dict)
-            and _is_number((_na["intake"].get("achievement") or {}).get("energy_pct")))
+    # 审查 P2-3（2026-08-18）：nutrition_valid 与 _derive_status 共用
+    # _extract_energy_achievement_pct 单一解析（防两套逻辑 schema drift）。
+    nutrition_valid = _extract_energy_achievement_pct(nutrition_assessment) is not None
     # MX-1：家长/患儿（非临床角色）拿受限视图 —— sections 与 summary_markdown 一致脱敏，
     # 避免经结构化章节泄露原始化验值（红队 C8：原仅脱敏 summary，sections 仍透出 raw scr/k）。
     mask = caller in _NON_CLINICAL_MASKED
@@ -832,6 +906,11 @@ def generate_patient_report(patient_id: str, demographics: dict, lab_summary: di
             # 患者历史出现过的最严重 PEW 等级）。
             "current_level": pew_info["current_level"],
             "historical_peak": pew_info["historical_peak"],
+            # 审查 P2-1/P2-2（2026-08-18）：同时间点重复/冲突统计（上游数据质量）
+            # + 历史高风险机器标志（历史中间恶化不进 trend 但必须保留提示）。
+            "duplicate_timestamp_count": pew_info["duplicate_timestamp_count"],
+            "conflict_count": pew_info["conflict_count"],
+            "historical_high_risk": pew_info["historical_high_risk"],
             # M-2（2026-08-16，十一审）：架构语言不进家长上下文——此前 source 硬编码
             # "M3 (ADR-007)"（内部模块编号），家长报告暴露架构语言。改中性描述。
             "source": "PEW 历史（营养评估）",
@@ -841,7 +920,12 @@ def generate_patient_report(patient_id: str, demographics: dict, lab_summary: di
         "risk": {"level": risk_level,
                  # 六审（2026-08-13）：未知等级显式标注——_derive_status 对非法
                  # risk_level 静默归 stable（fail-open 掩盖真实风险），报告必须透明。
-                 "valid": not risk_unknown},
+                 "valid": not risk_unknown,
+                 # 审查 P1-4（2026-08-18）：非法 risk_level fallback 的机器可读原因——
+                 # 真实 caution（L2/medium）与非法输入 fallback 的 caution 在只读
+                 # overall_status 时不可区分；reason 字段让下游程序化区分：
+                 # "VALID"=真实等级 / "INVALID_RISK_LEVEL"=非法输入按保守口径兜底。
+                 "reason": "VALID" if not risk_unknown else "INVALID_RISK_LEVEL"},
         # F7（2026-08-17）：营养摄入达成率未评估透明化——空 dict/无摄入数据时
         # nutrition_valid=false，报告显式提示（不把"没数据"当"达成 100%"）。
         "nutrition_valid": nutrition_valid,
@@ -923,6 +1007,13 @@ def generate_patient_report(patient_id: str, demographics: dict, lab_summary: di
 
     # S1（2026-08-12 五包审查）：统一 {ok, data} 信封——此前 {ok, patient_id, ...} 平铺
     # 无 data 包裹，与其余四包契约分裂；编排层可统一按 data 取业务字段。
+    # 审查 P2-5（2026-08-18）：报告总长度上限——超大 lab_summary/followup_summary
+    # 即使逐项截断仍可能整体膨胀（数千个键/值），超 _MAX_RENDERED_CHARS 截断标注，
+    # 控制 MCP response 与 LLM 上下文占用。
+    summary_markdown = "\n".join(lines)
+    if len(summary_markdown) > _MAX_RENDERED_CHARS:
+        summary_markdown = summary_markdown[:_MAX_RENDERED_CHARS] + (
+            "\n\n> ⚠ 报告内容过长，已截断（超出最大渲染字符数）")
     return {
         "ok": True,
         "data": {
@@ -933,7 +1024,7 @@ def generate_patient_report(patient_id: str, demographics: dict, lab_summary: di
             "overall_status": overall_status,
             "pew_trend": trend,
             "sections": sections,
-            "summary_markdown": "\n".join(lines),
+            "summary_markdown": summary_markdown,
         },
     }
 
@@ -944,8 +1035,12 @@ def _md_escape(value: Any) -> str:
     代码块/表格）。换行折叠为空格（保持单行条目语义），元字符转义为字面量。
     P2-3（2026-08-18）：**先 html.escape 再 md 转义**——此前不处理 <script> 等 HTML
     标签，支持 HTML 渲染的前端存在 XSS 风险；html.escape 处理 & < > " '（在 md
-    转义前做，避免引入的实体被后续转义破坏）。"""
+    转义前做，避免引入的实体被后续转义破坏）。
+    审查 P2-5（2026-08-18）：超长文本截断（_MAX_TEXT_LENGTH）——自由文本字段
+    无上限会撑爆 Markdown 输出 / MCP response / LLM 上下文。"""
     text = str(value if value is not None else "")
+    if len(text) > _MAX_TEXT_LENGTH:
+        text = text[:_MAX_TEXT_LENGTH] + "…（已截断）"
     text = text.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
     text = html.escape(text)  # P2-3：HTML 标签/实体转义（XSS 防护）
     return (text.replace("\\", "\\\\").replace("`", "\\`").replace("*", "\\*")
@@ -953,13 +1048,17 @@ def _md_escape(value: Any) -> str:
             .replace("#", "\\#").replace(">", "\\>").replace("|", "\\|"))
 
 
-def _fmt_dict(d: Any) -> str:
+def _fmt_dict(d: Any, _depth: int = 0) -> str:
     # BUG-56（2026-08-12）：None 返回 "" 而非 "None"——否则 "None" or "（无）" 会渲染出
     # "二、最新化验：None" 而非预期的 "（无）"。
     # CT-Q1 修复（2026-08-14）：**嵌套 dict/list 递归格式化**——此前 f"- {k}：{v}"
     # 对嵌套结构直接 str(v) → Python repr（{'achievement': {...}}）渲染进家长报告，
     # PII 文本与机器可读 repr 混入 markdown。递归后嵌套键渲染为缩进子列表。
     # B2（2026-08-15）：标量值经 _md_escape 转义（防自由文本注入 markdown 结构）。
+    # 审查 P2-4（2026-08-18）：递归深度上限——外部构造 1000 层嵌套 dict 此前触发
+    # RecursionError（报告生成崩溃）；超过 _MAX_RENDER_DEPTH 显式省略。
+    if _depth > _MAX_RENDER_DEPTH:
+        return "（嵌套过深，已省略）"
     if d is None:
         return ""
     if isinstance(d, dict):
@@ -968,10 +1067,10 @@ def _fmt_dict(d: Any) -> str:
         lines = []
         for k, v in d.items():
             if isinstance(v, dict):
-                inner = _fmt_dict(v)
+                inner = _fmt_dict(v, _depth + 1)
                 lines.append(f"- {_md_escape(k)}：{inner if inner else '（无）'}")
             elif isinstance(v, (list, tuple)):
-                inner = _fmt_list(v)
+                inner = _fmt_list(v, _depth + 1)
                 lines.append(f"- {_md_escape(k)}：{inner if inner else '（无）'}")
             else:
                 lines.append(f"- {_md_escape(k)}：{_md_escape(v)}")
@@ -979,17 +1078,28 @@ def _fmt_dict(d: Any) -> str:
     return _md_escape(d)
 
 
-def _fmt_list(items: Any) -> str:
-    """列表递归渲染：元素为 dict → 递归 _fmt_dict；标量 → 顿号拼接（B2 转义）。"""
+def _fmt_list(items: Any, _depth: int = 0) -> str:
+    """列表递归渲染：元素为 dict → 递归 _fmt_dict；标量 → 顿号拼接（B2 转义）。
+
+    审查 P2-4/P2-5（2026-08-18）：递归深度上限（同 _fmt_dict）+ 超大列表截断——
+    报告数据含 ["x"]*1000000 时此前全量渲染（CPU/内存/Markdown 膨胀）；现最多
+    渲染 _MAX_LIST_ITEMS 项，超限明确标注"共 N 项，仅显示前 M 项"。
+    """
+    if _depth > _MAX_RENDER_DEPTH:
+        return "（嵌套过深，已省略）"
     if not items:
         return ""
     parts = []
-    for it in items:
+    total = len(items)
+    shown = min(total, _MAX_LIST_ITEMS)
+    for it in items[:shown]:
         if isinstance(it, dict):
-            inner = _fmt_dict(it)
+            inner = _fmt_dict(it, _depth + 1)
             parts.append(inner if inner else "（无）")
         else:
             parts.append(_md_escape(it))
+    if total > shown:
+        parts.append(f"…共 {total} 项，仅显示前 {shown} 项")
     return "；".join(parts)
 
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "CKDNutri-content-mcp"
-version = "0.3.34"
+version = "0.3.35"
 description = "P5 内容输出域——报告生成+循证知识库"
 requires-python = ">=3.10"
 dependencies = [
@@ -24,3 +24,15 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 CKDNutri_content_mcp = ["data/*.json"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+exclude = ["build", "dist"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]  # 行超长不阻断（存量历史注释多），仅提示
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402"]  # 测试：sys.path/env 设置在 import 前（既有标准模式）

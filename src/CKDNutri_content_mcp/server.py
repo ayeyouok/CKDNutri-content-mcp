@@ -8,13 +8,11 @@ v0.3.9（BUG-16）修复：工具命名统一 _tool 后缀，与其他域包（*
 """
 from __future__ import annotations
 
-import json
 import logging
-from typing import Any, Optional
-
-from fastmcp import FastMCP
+from typing import Any
 
 from a207_policy import translate_error
+from fastmcp import FastMCP
 
 from . import core as _core
 
@@ -44,7 +42,7 @@ def main():
 # ---- M12: 循证知识库 ----
 
 @mcp.tool
-def search_guideline_tool(keyword: str, guideline_set: Optional[str] = None,
+def search_guideline_tool(keyword: str, guideline_set: str | None = None,
                           limit: int = 20) -> dict[str, Any]:
     """关键词检索指南（按角色视图裁剪：临床=专业语料，家庭=通俗语料）。
     limit（P2 修复 2026-08-13）：结果上限（默认 20、上限 100），防全量命中灌爆上下文。"""
@@ -81,7 +79,7 @@ def generate_report_tool(
     lab_summary: dict,
     nutrition_assessment: dict,
     followup_summary: dict,
-    pew_history: Optional[list] = None,
+    pew_history: list | None = None,
     risk_level: str = "unknown",
 ) -> dict[str, Any]:
     """生成结构化患者报告（按身份视图裁剪：非临床角色脱敏）。
