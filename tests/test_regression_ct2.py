@@ -11,6 +11,9 @@
 - P2-4：深层嵌套不 RecursionError（渲染深度上限）
 - P2-5：超大 list 截断 + 超长文本截断
 - P2-6：core 非法入参抛 InvalidArgumentError（不构造 MCP envelope）
+
+运行：pytest tests/test_regression_ct2.py（或 python tests/test_regression_ct2.py 直接运行，
+CI 的 publish workflow 逐文件 `python tests/test_*.py`，**不安装 pytest**——本文件不依赖 pytest）。
 """
 import os
 
@@ -26,9 +29,29 @@ for p in (_SRC, _POLICY):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
-import pytest
-
 from CKDNutri_content_mcp import core
+
+
+def _expect_raises(exc_type, fn, *args, **kwargs):
+    """断言 fn(*args, **kwargs) 抛 exc_type——不依赖 pytest（CI 直接运行模式）。
+
+    返回捕获的异常实例供进一步断言。
+    """
+    try:
+        fn(*args, **kwargs)
+    except exc_type as exc:
+        return exc
+    raise AssertionError(f"expected {exc_type.__name__} to be raised, got success")
+
+
+def _run_all() -> None:
+    """直接运行模式：执行本文件全部 test_* 函数（CI 的 `python tests/test_*.py`）。"""
+    import sys as _sys
+
+    for _name, _fn in sorted(vars(_sys.modules[__name__]).items()):
+        if _name.startswith("test_") and callable(_fn):
+            _fn()
+    print("P5 CT2 REGRESSION OK")
 
 
 def _report(demographics, lab_summary=None, nutrition=None, followup=None,
@@ -65,8 +88,7 @@ def test_p11_sex_canonicalize():
 def test_p12_ckd_stage_whitelist_rejects():
     """P1-2：CKD99 / banana / G99 / 空串 一律拒绝（非法 stage 不得进患者报告）。"""
     for bad in ("CKD99", "banana", "G99", "", "stage3"):
-        with pytest.raises(core.InvalidArgumentError):
-            _report(_base_demo(ckd_stage=bad))
+        _expect_raises(core.InvalidArgumentError, lambda b=bad: _report(_base_demo(ckd_stage=b)))
 
 
 def test_p12_ckd_stage_canonicalize():
@@ -86,8 +108,8 @@ def test_p13_dialysis_mode_canonicalize():
         r = _report(_base_demo(dialysis_mode=raw))
         got = r["data"]["sections"]["patient"]["dialysis_mode"]
         assert got == raw.strip().lower(), (raw, got)
-    with pytest.raises(core.InvalidArgumentError):
-        _report(_base_demo(dialysis_mode="hemodialysls"))  # 拼写错误
+    _expect_raises(core.InvalidArgumentError,
+                   lambda: _report(_base_demo(dialysis_mode="hemodialysls")))  # 拼写错误
 
 
 # ---- P1-4：非法 risk_level 机器可读原因 ----
@@ -204,7 +226,12 @@ def test_p25_long_text_truncated():
 
 def test_p26_invalid_patient_id_raises():
     """P2-6：畸形 patient_id 抛 InvalidArgumentError（非返回错误信封）。"""
-    with pytest.raises(core.InvalidArgumentError):
-        core.generate_patient_report(
+    _expect_raises(
+        core.InvalidArgumentError,
+        lambda: core.generate_patient_report(
             patient_id="abc", demographics=_base_demo(), lab_summary={},
-            nutrition_assessment={}, followup_summary={}, pew_history=[], risk_level="L2")
+            nutrition_assessment={}, followup_summary={}, pew_history=[], risk_level="L2"))
+
+
+if __name__ == "__main__":
+    _run_all()
