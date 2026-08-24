@@ -177,9 +177,12 @@ def _match(text: str, query: str) -> bool:
 def _guideline_set_lookup() -> dict[str, str]:
     """指南 set 合法值（加载期从数据收集，防硬编码漂移）→ 小写名 → 规范名。"""
     guides = _load_guides()
+    # 十七审（2026-08-24，C4）：过滤条件由 `if e.get("set")` 改为
+    # `if str(e.get("set") or "").strip()`——全空格 "   " 在前者为 truthy，会混入
+    # 空字符串键 ""（后续 _validate_guideline_set 报错提示 `可用：['', 'CHINA2023'...]`）。
     return {
         str(e.get("set") or "").strip().lower(): str(e.get("set")).strip()
-        for e in guides["entries"] if e.get("set")
+        for e in guides["entries"] if str(e.get("set") or "").strip()
     }
 
 
@@ -264,6 +267,11 @@ def search_guideline(query: str, guideline_set: str | None = None,
             # CT-B1（2026-08-14）：空分支补 truncated（与正常分支信封键一致，
             # 编排层无需区分空/非空两种形状）
             "truncated": False,
+            # 十七审（2026-08-24，C3）：空分支补齐 requested_limit/effective_limit，
+            # 与正常分支信封结构 100% 对齐——上层网关统一读取 data.effective_limit
+            # 时不再因空查询分支 KeyError。effective_limit 取 min(limit,100) 与
+            # 正常分支钳制口径一致；requested_limit 取调用方原始值 raw_limit。
+            "requested_limit": raw_limit, "effective_limit": min(limit, 100),
             "note": "查询关键词为空，未执行检索；请提供有效关键词。"}}
     out = []
     for e in guides["entries"]:
@@ -344,6 +352,9 @@ def search_sop(query: str, limit: int = 20) -> dict[str, Any]:
             # CT-B1（2026-08-14）：补 view（与 search_guideline 信封一致，编排层统一
             # 取 data.view；此前 SOP 的 view 只出现在结果条目层，形状分裂）
             "view": view, "truncated": False,
+            # 十七审（2026-08-24，C3）：空分支补齐 requested_limit/effective_limit，
+            # 与正常分支信封结构对齐（同 search_guideline 口径）。
+            "requested_limit": raw_limit, "effective_limit": min(limit, 100),
             "note": "查询关键词为空，未执行检索；请提供有效关键词。"}}
     out = []
     for s in sops["sops"]:
@@ -586,22 +597,30 @@ def _pew_trend_info(pew_history: list[dict]) -> dict[str, Any]:
     duplicate_timestamp_count = len(dated) - len(by_timestamp)
     conflict_count = sum(1 for s in by_timestamp.values() if len(s["levels"]) > 1)
     canon = [by_timestamp[t] for t in sorted(by_timestamp)]
-    fo = canon[0]["lv"]
-    lo = canon[-1]["lv"]
-    # P0-2（2026-08-18）：**解耦"当前风险 / 历史最高 / 发展趋势"三概念**——
-    # 此前趋势 = 首点 vs 全程最高严重度（peak=max）：患者历史出现过 L1（哪怕早已
-    # 完全恢复）也永远 worsening，最终状态被历史峰值错误抬高（"历史病情永久恶化"
-    # 误判，修复前 M 注释自述行为）。现：
-    #   - trend：仅首尾比较（近期变化，lo vs fo）；
-    #   - current_level：当前（最新有效点）等级，供报告透明展示；
-    #   - historical_peak：全程最高等级，**只做透明展示**（历史高风险背景仍可见），
-    #     不再直接驱动状态抬升（当前状态由当前风险 + 近期趋势决定）。
-    if lo > fo:
-        trend = "worsening"
-    elif lo < fo:
-        trend = "improving"
+    # 十七审（2026-08-24，C2）：去重后有效时间点 < 2 时**不能**做首尾趋势比较——
+    # 入口守卫 `len(dated) < 2` 仅在去重**前**生效，两条同 timestamp 记录会绕过
+    # 它（dated=2 但通过 by_timestamp 去重后 canon 长度=1），此时 canon[0]==canon[-1]
+    # 恒定 fo==lo，原逻辑误判 "stable"，而实际仅有一个时间点、不存在时间跨度趋势。
+    # 此处独立守卫：去重后若不足 2 个离散时间点，必须返回 "no_data"。
+    if len(canon) < 2:
+        trend = "no_data"
     else:
-        trend = "stable"
+        fo = canon[0]["lv"]
+        lo = canon[-1]["lv"]
+        # P0-2（2026-08-18）：**解耦"当前风险 / 历史最高 / 发展趋势"三概念**——
+        # 此前趋势 = 首点 vs 全程最高严重度（peak=max）：患者历史出现过 L1（哪怕早已
+        # 完全恢复）也永远 worsening，最终状态被历史峰值错误抬高（"历史病情永久恶化"
+        # 误判，修复前 M 注释自述行为）。现：
+        #   - trend：仅首尾比较（近期变化，lo vs fo）；
+        #   - current_level：当前（最新有效点）等级，供报告透明展示；
+        #   - historical_peak：全程最高等级，**只做透明展示**（历史高风险背景仍可见），
+        #     不再直接驱动状态抬升（当前状态由当前风险 + 近期趋势决定）。
+        if lo > fo:
+            trend = "worsening"
+        elif lo < fo:
+            trend = "improving"
+        else:
+            trend = "stable"
     _peak_entry = max(canon, key=lambda s: s["lv"])
     _hist_lv = _peak_entry["lv"]
     return {"trend": trend, "valid_count": len(dated), "total_count": total_count,
@@ -961,7 +980,12 @@ def generate_patient_report(patient_id: str, demographics: dict, lab_summary: di
     _stage = demographics.get("ckd_stage")
     stage_str = _stage if _stage is not None else "未提供"
     _dm = demographics.get("dialysis_mode")
-    dm_str = _dm if _dm is not None else "未提供"
+    # 十七审（2026-08-24，C5）：透析方式中文映射（呈现层打磨）——入参经
+    # _validate_and_canonicalize_demographics 已归一为小写枚举
+    # {none, hemodialysis, peritoneal}，此处仅做展示翻译；不改动
+    # sections["patient"]["dialysis_mode"]（保持机器可读原值，避免破坏测试断言）。
+    _dm_map = {"none": "未透析", "hemodialysis": "血液透析", "peritoneal": "腹膜透析"}
+    dm_str = _dm_map.get(_dm, _dm) if _dm is not None else "未提供"
     lines.append(_section(
         "一、基本信息",
         f"- 年龄：{age_str}　性别：{d_sex}\n"
@@ -1079,7 +1103,11 @@ def _md_escape(value: Any) -> str:
     if len(text) > _MAX_TEXT_LENGTH:
         text = text[:_MAX_TEXT_LENGTH] + "…（已截断）"
     text = text.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
-    text = html.escape(text)  # P2-3：HTML 标签/实体转义（XSS 防护）
+    # 十七审（2026-08-24，C1）：quote=False——markdown 正文不在 HTML 属性引号内，
+    # 无需转义 ' "；默认 quote=True 会把 ' 转成 &#x27;，后续 .replace("#","\\#")
+    # 破坏实体成 &\#x27;，含英文撇号文本（Crohn's disease）前端渲染乱码。
+    # & < > 的 XSS 防护在 quote=False 下仍完整。
+    text = html.escape(text, quote=False)  # P2-3：HTML 标签/实体转义（XSS 防护）
     return (text.replace("\\", "\\\\").replace("`", "\\`").replace("*", "\\*")
             .replace("_", "\\_").replace("[", "\\[").replace("]", "\\]")
             .replace("#", "\\#").replace(">", "\\>").replace("|", "\\|"))
