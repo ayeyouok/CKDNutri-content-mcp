@@ -71,10 +71,14 @@ def test_guideline_set_lookup_strips_whitespace():
         {"set": "KDIGO2024", "id": "a", "title": "t"},
         {"set": "   ", "id": "b", "title": "t2"},
     ]}
+    saved = core._load_guides
     core._load_guides = lambda: fake
-    lut = core._guideline_set_lookup()
-    assert "" not in lut, lut
-    assert "kdigo2024" in lut, lut
+    try:
+        lut = core._guideline_set_lookup()
+        assert "" not in lut, lut
+        assert "kdigo2024" in lut, lut
+    finally:
+        core._load_guides = saved  # 卫生：还原，避免污染后续测试（get_citation 依赖真实加载）
 
 
 def test_dialysis_mode_chinese_mapping():

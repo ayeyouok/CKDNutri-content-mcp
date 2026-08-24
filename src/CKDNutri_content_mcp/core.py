@@ -281,7 +281,10 @@ def search_guideline(query: str, guideline_set: str | None = None,
         # 字段（title+tags+set+视图正文），消除"幻影匹配"——非临床角色不再因 full 临床文案命中，
         # 命中理由与返回内容一致；set（如 KDIGO2024）在结果中可见，纳入检索（BUG-62）。
         tags = " ".join(str(t) for t in (e.get("tags") or []))
-        hay = " ".join([e["title"], tags, str(e.get("set") or ""), e.get(view, "")])
+        # 十八审（2026-08-24，C7）：haystack 必须含 e["id"]——临床/编排 Agent 常按规范
+        # 编号（如 "KDIGO2024-K" / "PRNT2020-ENERGY"）精确检索，标题与正文往往不含该
+        # 字面量，漏拼 id 会 100% 召回失败。
+        hay = " ".join([e["id"], e["title"], tags, str(e.get("set") or ""), e.get(view, "")])
         if not _match(hay, query):
             continue
         out.append({
@@ -362,7 +365,9 @@ def search_sop(query: str, limit: int = 20) -> dict[str, Any]:
         # child 显式 null 时以 (s.get("child") or "") 兜底，避免 " ".join 抛 TypeError。
         tags = " ".join(str(t) for t in (s.get("tags") or []))
         body = s["content"] if view == "full" else (s.get(view) or s.get("child") or "")
-        hay = " ".join([s["title"], tags, body])
+        # 十八审（2026-08-24，C7）：haystack 必须含 s["id"]——同 search_guideline 口径，
+        # 支持按规范编号（如 "SOP-HYPERK-EMERG"）精确检索。
+        hay = " ".join([s["id"], s["title"], tags, body])
         if _match(hay, query):
             if view == "full":
                 content = s["content"]
@@ -416,20 +421,21 @@ def get_citation(ref_id: str) -> dict[str, Any]:
     # P1-2（2026-08-18）：strip 归一化——此前仅校验时 strip、匹配 `e["id"] == ref_id`
     # 用原始串，带首尾空格的合法 ID（" KDIGO2024-001 "）匹配失败返回 NOT_FOUND。
     ref_id = ref_id.strip()
-    _validate_cross_file_ids()
+    ref_lower = ref_id.lower()  # 十八审（2026-08-24，C10）：大小写容错——上游 Agent 传入
+    _validate_cross_file_ids()  # "kdigo2024-k" / "sop-hyperk-emerg" 等小写不应返回 NOT_FOUND。
     guides = _load_guides()
     for e in guides["entries"]:
-        if e["id"] == ref_id:
+        if e["id"].lower() == ref_lower:
             citation = (f"[{e['id']}] {e['title']}. {e['source']} "
                         f"（推荐强度：{e['strength']}；证据级别：{e['evidence']}）")
-            return {"ok": True, "data": {"ref_id": ref_id, "citation": citation,
+            return {"ok": True, "data": {"ref_id": e["id"], "citation": citation,
                                          "source": e["source"], "strength": e["strength"],
                                          "evidence": e["evidence"]}}
     sops = _load_sops()
     for s in sops["sops"]:
-        if s["id"] == ref_id:
+        if s["id"].lower() == ref_lower:
             citation = f"[{s['id']}] {s['title']}. {s['source']}"
-            return {"ok": True, "data": {"ref_id": ref_id, "citation": citation,
+            return {"ok": True, "data": {"ref_id": s["id"], "citation": citation,
                                          "source": s["source"]}}
     # S1（2026-08-12 五包审查）：统一 {ok, data} 信封——未找到由扁平 error 字段改为
     # 标准 {ok: false, error: NOT_FOUND, detail} 失败信封（编排层可统一按 ok 分支）。
@@ -561,7 +567,11 @@ def _pew_trend_info(pew_history: list[dict]) -> dict[str, Any]:
             invalid_level_count += 1
             continue
         dated.append((dt, p))
-    if len(dated) < 2:
+    # 十八审（2026-08-24，C8）：仅当**无任何有效时间点**才抹除当前等级/高危标志；
+    # 单条有效记录（如初诊确诊 L1 重度营养不良）必须保留 current_level 与
+    # historical_high_risk，否则向临床/家长掩盖初诊患儿的高危信号。趋势仍仅在
+    # 去重后 >=2 个离散时间点才计算（下方独立守卫），单点归 no_data。
+    if len(dated) == 0:
         return {"trend": "no_data", "valid_count": len(dated), "total_count": total_count,
                 # P1-1（2026-08-18）：按原因分类统计——统一"日期格式无效"会误导
                 # （风险等级非法/缺 level/非 dict 都被归为日期错误，医疗语义失真）。
@@ -784,6 +794,9 @@ def _validate_and_canonicalize_demographics(demographics: dict) -> None:
         "CKD1": "G1", "CKD2": "G2", "CKD3": "G3", "CKD4": "G4", "CKD5": "G5",
         "G1": "G1", "G2": "G2", "G3": "G3", "G4": "G4", "G5": "G5",
         "G3A": "G3a", "G3B": "G3b",
+        # 十八审（2026-08-24，C11）：补充临床常见记法别名——"3A"/"3B"（无 CKD 前缀）、
+        # "CKD3A"/"CKD3B" 均归一为 G3a/G3b 子分期，避免上游传入被拒。
+        "3A": "G3a", "3B": "G3b", "CKD3A": "G3a", "CKD3B": "G3b",
     }
     _DM = ("none", "hemodialysis", "peritoneal")
     age = demographics.get("age_years")
@@ -1002,6 +1015,9 @@ def generate_patient_report(patient_id: str, demographics: dict, lab_summary: di
     if not nutrition_valid:
         lines.append("> ⚠ 营养摄入数据未提供（或未评估），摄入达成率不参与整体状态判定；"
                      "请补充 3 日饮食日记后复评。")
+        # 十八审（2026-08-24，C9）：引用块须以空行与后续 section 标题隔离——
+        # 否则严格 CommonMark 解析器会把下一行 "### 四、随访与依从" 吞进引用块，层级塌陷。
+        lines.append("")
     _fu = (_mask_clinician_fields(followup_summary) if mask else followup_summary) or {}
     # BUG-63（2026-08-12）：类型安全提取——records/adherence 非列表时原 [-1] 索引会
     # TypeError；plans 为数值（如 3 表示 3 项计划）时原 len() 也崩，数值按计数处理。
@@ -1060,7 +1076,10 @@ def generate_patient_report(patient_id: str, demographics: dict, lab_summary: di
         + _pew_hist_note
         + _invalid_note))
     # 六审：未知风险等级在 markdown 中显式提示（不静默展示为"稳定"）
-    risk_line = f"- 等级：{risk_level}"
+    # 十八审（2026-08-24，C6）：risk_level 为外部可控入参，必须经 _md_escape 转义——
+    # 防脏数据/恶意构造的换行与 markdown 元字符伪造标题与结论（医疗报告篡改）。
+    # _md_escape 已先于转义把换行折叠为空格（XSS + 结构注入双重防护）。
+    risk_line = f"- 等级：{_md_escape(risk_level)}"
     if risk_unknown:
         risk_line += "（⚠ 无法解析的风险等级，整体状态按保守口径展示，请核对上游评估输出）"
     lines.append(_section("六、风险等级", risk_line))
