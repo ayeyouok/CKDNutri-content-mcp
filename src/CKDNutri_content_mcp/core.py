@@ -338,7 +338,7 @@ def search_sop(query: str, limit: int = 20) -> dict[str, Any]:
     # 四审（2026-08-12）：空关键词显式提示（与 search_guideline 同口径）
     if not (query or "").strip():
         return {"ok": True, "data": {
-            "query": query, "count": 0,
+            "query": query, "role": caller, "count": 0,
             # P2-1（2026-08-18）：空分支补 returned_count（与正常分支 Schema 一致）
             "returned_count": 0, "results": [],
             # CT-B1（2026-08-14）：补 view（与 search_guideline 信封一致，编排层统一
@@ -374,6 +374,9 @@ def search_sop(query: str, limit: int = 20) -> dict[str, Any]:
     limit = min(limit, 100)
     truncated = len(out) > limit
     return {"ok": True, "data": {"query": query,
+                                 # 十六审（2026-08-24，#4）：补 role/view 与 search_guideline
+                                 # 信封对齐（编排层统一取 data.role/data.view），消除 Schema 漂移。
+                                 "role": caller, "view": view,
                                  # P1-4（2026-08-18）：count=命中总数、returned_count=实际返回数
                                  # P2-1（2026-08-18）：requested/effective_limit 语义透明
                                  "count": len(out), "returned_count": min(len(out), limit),
@@ -741,22 +744,16 @@ def _ensure_dict(value: Any, name: str) -> dict:
     return value
 
 
-def _validate_demographics(demographics: dict) -> None:
-    """P2-2（2026-08-18）：demographics 子字段基础 Schema 校验（fail-closed）。
+def _validate_and_canonicalize_demographics(demographics: dict) -> None:
+    """P2-2（2026-08-18）：demographics 子字段基础 Schema 校验 + **就地 canonicalize**。
+
+    ⚠️ 注意：本函数**就地修改入参 dict**（非纯函数）——校验通过后把 sex/ckd_stage/
+    dialysis_mode 归一为 canonical 值写回原 dict，调用方（generate_patient_report）
+    直接消费写回后的 canonical 值渲染报告。这是有意设计（P1 约定：下游只消费
+    canonical 值，杜绝同字段多表示），非副作用 bug；若需保留原 dict 请先 copy。
 
     校验 age_years（非负有限数值）、sex（M/F）、ckd_stage（CKD1-5/G1-5 分期）、
     dialysis_mode（none/hemodialysis/peritoneal）；None/缺省跳过（未提供合法）。
-
-    审查 P1-1/P1-2/P1-3（2026-08-18）：**校验通过即 canonicalize 写回原 dict**——
-    此前 sex=" m "/dialysis_mode=" Hemodialysis " 等带空格/大小写变体校验通过但
-    报告层沿用原始值（"报告：m"），同一字段多种表示形式破坏结构化输出稳定性；
-    ckd_stage 字符串此前只查非空，"CKD99"/"banana" 能穿透进患者报告（医疗数据
-    质量问题）。现统一：
-      - sex          → "M" / "F"
-      - ckd_stage    → 白名单枚举（数字 1-5 / CKD1-5 / G1-5 / G3a|G3A / G3b|G3B），
-                       canonical 输出 "G1"~"G5" / "G3a" / "G3b"（对齐 assessment 输出）；
-                       非法值显式抛 InvalidArgumentError
-      - dialysis_mode → "none" / "hemodialysis" / "peritoneal"
     非法即抛 InvalidArgumentError（server 层 translate_error 归 INVALID_INPUT）。
     """
     _SEX = ("M", "F")
@@ -877,7 +874,7 @@ def generate_patient_report(patient_id: str, demographics: dict, lab_summary: di
     # 家长侧显示乱码值）。非法即 INVALID_INPUT，不静默透传。
     # 审查 P1-1/P1-2/P1-3（2026-08-18）：校验通过即就地 canonicalize（sex→M/F、
     # ckd_stage→G 记法白名单、dialysis_mode→小写枚举），非法抛 InvalidArgumentError。
-    _validate_demographics(demographics)
+    _validate_and_canonicalize_demographics(demographics)
     # BUG-66 后补（2026-08-12）：透明化——trend 仅基于日期有效点计算，count 若用原始
     # len(ph) 会掩盖"10 条记录仅 2 条有效"的数据质量问题；用 _pew_trend_info 同时
     # 暴露 valid_count（参与计算点数）与 total_count（原始记录数）。
@@ -955,11 +952,20 @@ def generate_patient_report(patient_id: str, demographics: dict, lab_summary: di
 
     # ---- 文案（markdown）----
     lines = [f"# 患者报告 · {patient_id}", ""]
-    d_sex = {"M": "男", "F": "女"}.get(demographics.get("sex"), demographics.get("sex", "?"))
+    # 十六审（2026-08-24，#7）：缺失基本信息字段兜底为"未提供"，杜绝 Python None
+    # 字面量直接呈现给患儿/家长（医疗报告严谨性）。
+    _age = demographics.get("age_years")
+    age_str = f"{_age} 岁" if _age is not None else "未提供"
+    d_sex = {"M": "男", "F": "女"}.get(demographics.get("sex"),
+                                      demographics.get("sex") or "未提供")
+    _stage = demographics.get("ckd_stage")
+    stage_str = _stage if _stage is not None else "未提供"
+    _dm = demographics.get("dialysis_mode")
+    dm_str = _dm if _dm is not None else "未提供"
     lines.append(_section(
         "一、基本信息",
-        f"- 年龄：{demographics.get('age_years')} 岁　性别：{d_sex}\n"
-        f"- CKD 分期：{demographics.get('ckd_stage')}　透析方式：{demographics.get('dialysis_mode')}"))
+        f"- 年龄：{age_str}　性别：{d_sex}\n"
+        f"- CKD 分期：{stage_str}　透析方式：{dm_str}"))
     lines.append(_section("二、最新化验",
                           _fmt_dict(_mask_clinician_fields(lab_summary) if mask else lab_summary)
                           or "（无）"))
