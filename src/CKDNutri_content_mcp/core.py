@@ -174,16 +174,28 @@ def _match(text: str, query: str) -> bool:
     return q in text.lower()
 
 
+# 十二审（2026-08-24，#3）：指南 set 枚举字典并发安全缓存（Double-Checked Locking）——
+# 高频检索场景下每次调用都遍历 guides["entries"] 重建成字典属无谓 CPU/内存开销。guides
+# 为静态加载数据（加载期已校验），缓存后无需失效；DCL 防并发首调重复构建。
+_GUIDELINE_SET_LOOKUP: dict[str, str] | None = None
+_GUIDELINE_SET_LOCK = threading.Lock()
+
+
 def _guideline_set_lookup() -> dict[str, str]:
     """指南 set 合法值（加载期从数据收集，防硬编码漂移）→ 小写名 → 规范名。"""
-    guides = _load_guides()
-    # 十七审（2026-08-24，C4）：过滤条件由 `if e.get("set")` 改为
-    # `if str(e.get("set") or "").strip()`——全空格 "   " 在前者为 truthy，会混入
-    # 空字符串键 ""（后续 _validate_guideline_set 报错提示 `可用：['', 'CHINA2023'...]`）。
-    return {
-        str(e.get("set") or "").strip().lower(): str(e.get("set")).strip()
-        for e in guides["entries"] if str(e.get("set") or "").strip()
-    }
+    global _GUIDELINE_SET_LOOKUP
+    if _GUIDELINE_SET_LOOKUP is None:
+        with _GUIDELINE_SET_LOCK:
+            if _GUIDELINE_SET_LOOKUP is None:
+                guides = _load_guides()
+                # 十七审（2026-08-24，C4）：过滤条件由 `if e.get("set")` 改为
+                # `if str(e.get("set") or "").strip()`——全空格 "   " 在前者为 truthy，会混入
+                # 空字符串键 ""（后续 _validate_guideline_set 报错提示 `可用：['', 'CHINA2023'...]`）。
+                _GUIDELINE_SET_LOOKUP = {
+                    str(e.get("set") or "").strip().lower(): str(e.get("set")).strip()
+                    for e in guides["entries"] if str(e.get("set") or "").strip()
+                }
+    return _GUIDELINE_SET_LOOKUP
 
 
 class InvalidArgumentError(ValueError):
@@ -1051,13 +1063,20 @@ def generate_patient_report(patient_id: str, demographics: dict, lab_summary: di
     # "N 条无效"，数据质量越差（有效点越少）显示的"无效"反而越少，严重误导可信度判断。
     invalid_count = pew_info["total_count"] - pew_info["valid_count"]
     _pew_hist_note = ""
-    if pew_info["historical_peak"] is not None and \
-            str(pew_info["historical_peak"]).strip().lower() != \
-            str(pew_info.get("current_level") or "").strip().lower():
-        # P0-2（2026-08-18）：历史峰值透明展示——趋势不再携带"历史永久恶化"语义，
-        # 历史最高等级单独呈现，避免信息丢失。
-        _pew_hist_note = (f"\n- 当前等级：{pew_info['current_level']}　"
-                          f"历史最高：{pew_info['historical_peak']}")
+    _cur_lv = pew_info.get("current_level")
+    _peak_lv = pew_info.get("historical_peak")
+    # 十二审（2026-08-24，#1）：当前等级必须始终展示——场景 A（初诊单点 L1）/ 场景 B
+    # （持续同级 L2）下 historical_peak == current_level，原逻辑条件不满足 → 当前等级
+    # 整段漏显，报告 PEW 章节完全不输出患儿当前营养消耗档位（临床信息缺失）。修正：
+    # current_level 存在即展示；仅当 historical_peak 与之不同而更有信息时追加"历史最高"。
+    if _cur_lv is not None:
+        if _peak_lv is not None and str(_peak_lv).strip().lower() != str(_cur_lv).strip().lower():
+            # P0-2（2026-08-18）：历史峰值透明展示——趋势不再携带"历史永久恶化"语义，
+            # 历史最高等级单独呈现，避免信息丢失。
+            _pew_hist_note = (f"\n- 当前等级：{_cur_lv}　"
+                              f"历史最高：{_peak_lv}")
+        else:
+            _pew_hist_note = f"\n- 当前等级：{_cur_lv}"
     # P1-1（2026-08-18）：无效原因分类提示——此前统一"日期格式无效"误导
     # （风险等级非法/缺 level/非 dict 被归为日期错误，医疗语义失真）。
     _invalid_parts = []
@@ -1141,6 +1160,9 @@ def _fmt_dict(d: Any, _depth: int = 0) -> str:
     # B2（2026-08-15）：标量值经 _md_escape 转义（防自由文本注入 markdown 结构）。
     # 审查 P2-4（2026-08-18）：递归深度上限——外部构造 1000 层嵌套 dict 此前触发
     # RecursionError（报告生成崩溃）；超过 _MAX_RENDER_DEPTH 显式省略。
+    # 十二审（2026-08-24，#2）：严格按深度缩进——此前嵌套子列表无 indent 前缀，产生
+    # 双重弹头（"- electrolytes：- k：..."）且子项被 Markdown 解析为顶层列表（层级错位）。
+    # 现引入 indent = "  " * _depth，逐层递增缩进，杜绝结构错乱。
     if _depth > _MAX_RENDER_DEPTH:
         return "（嵌套过深，已省略）"
     if d is None:
@@ -1149,17 +1171,25 @@ def _fmt_dict(d: Any, _depth: int = 0) -> str:
         if not d:
             return ""
         lines = []
+        indent = "  " * _depth
         for k, v in d.items():
+            k_esc = _md_escape(k)
             if isinstance(v, dict):
-                inner = _fmt_dict(v, _depth + 1)
-                lines.append(f"- {_md_escape(k)}：{inner if inner else '（无）'}")
+                if not v:
+                    lines.append(f"{indent}- {k_esc}：（无）")
+                else:
+                    inner = _fmt_dict(v, _depth + 1)
+                    lines.append(f"{indent}- {k_esc}：\n{inner}")
             elif isinstance(v, (list, tuple)):
-                inner = _fmt_list(v, _depth + 1)
-                lines.append(f"- {_md_escape(k)}：{inner if inner else '（无）'}")
+                if not v:
+                    lines.append(f"{indent}- {k_esc}：（无）")
+                else:
+                    inner = _fmt_list(v, _depth + 1)
+                    lines.append(f"{indent}- {k_esc}：\n{inner}")
             else:
-                lines.append(f"- {_md_escape(k)}：{_md_escape(v)}")
+                lines.append(f"{indent}- {k_esc}：{_md_escape(v)}")
         return "\n".join(lines)
-    return _md_escape(d)
+    return f"{'  ' * _depth}{_md_escape(d)}"
 
 
 def _fmt_list(items: Any, _depth: int = 0) -> str:
@@ -1168,23 +1198,27 @@ def _fmt_list(items: Any, _depth: int = 0) -> str:
     审查 P2-4/P2-5（2026-08-18）：递归深度上限（同 _fmt_dict）+ 超大列表截断——
     报告数据含 ["x"]*1000000 时此前全量渲染（CPU/内存/Markdown 膨胀）；现最多
     渲染 _MAX_LIST_ITEMS 项，超限明确标注"共 N 项，仅显示前 M 项"。
+    十二审（2026-08-24，#2）：缩进与 _fmt_dict 对称，子列表逐级递增缩进。
     """
     if _depth > _MAX_RENDER_DEPTH:
         return "（嵌套过深，已省略）"
     if not items:
         return ""
-    parts = []
+    lines = []
     total = len(items)
     shown = min(total, _MAX_LIST_ITEMS)
+    indent = "  " * _depth
     for it in items[:shown]:
         if isinstance(it, dict):
             inner = _fmt_dict(it, _depth + 1)
-            parts.append(inner if inner else "（无）")
+            lines.append(f"{indent}- [项]\n{inner}" if inner else f"{indent}- [项]：（无）")
+        elif isinstance(it, (list, tuple)):
+            lines.append(_fmt_list(it, _depth + 1))
         else:
-            parts.append(_md_escape(it))
+            lines.append(f"{indent}- {_md_escape(it)}")
     if total > shown:
-        parts.append(f"…共 {total} 项，仅显示前 {shown} 项")
-    return "；".join(parts)
+        lines.append(f"{indent}- …共 {total} 项，仅显示前 {shown} 项")
+    return "\n".join(lines)
 
 
 def _fmt_block(d: Any) -> str:
